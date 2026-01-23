@@ -22,15 +22,7 @@ if(Boost_FOUND)
         mswsock
     )
 
-    add_executable(client chat_client.cpp)
-    target_link_libraries(client
-        PRIVATE 
-        Boost::system 
-        Boost::date_time
-        Boost::json
-        ws2_32 
-        mswsock
-    )
+   
 else()
     message(FATAL_ERROR "Boost не найден! Проверьте установку в MSYS2.")
 endif()
