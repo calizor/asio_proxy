@@ -9,17 +9,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Boost REQUIRED COMPONENTS system date_time beast json)
 
 if(Boost_FOUND)
-    include_directories(${Boost_INCLUDE_DIRS})
     add_executable(server chat_server.cpp)
+    target_include_directories(server 
+    PUBLIC ${Boost_INCLUDE_DIRS}
+    )
     
     # Линковка Boost и системных библиотек Windows для сокетов (ws2_32 и mswsock)
     target_link_libraries(server
         PRIVATE 
         Boost::system 
         Boost::beast
-        Boost::json
-        ws2_32 
-        mswsock
+        $<$<PLATFORM_ID:Windows>:ws2_32>
+        $<$<PLATFORM_ID:Windows>:mswsock>
     )
 
    

@@ -3,6 +3,9 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
+
 
 namespace asio = boost::asio;
 namespace http = boost::beast::http;
@@ -134,35 +137,54 @@ private:
 };
 
 // Сервер, принимающий новые подключения
-class ProxyServer {
+class ProxyServer : public std::enable_shared_from_this<ProxyServer>{
     tcp::acceptor acceptor_;
 
 public:
-    ProxyServer(asio::io_context& ctx, short port)
-        : acceptor_(ctx, {tcp::v4(), port}) {
-        do_accept();
-    }
+    ProxyServer(asio::io_context& ctx, unsigned short port)
+        : acceptor_(ctx, {tcp::v4(), port}) { }
 
-private:
     void do_accept() {
         acceptor_.async_accept(
-            [this](boost::system::error_code ec, tcp::socket socket) {
+            [self = shared_from_this()](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
                     std::make_shared<ProxySession>(std::move(socket))->start();
                 }
-                do_accept();
+               self->do_accept();
             });
     }
 };
 
-int main() {
-    try {
-        asio::io_context ctx;
-        ProxyServer server(ctx, 8080);
-        std::cout << "Proxy running on port 8080..." << std::endl;
-        ctx.run();
-    } catch (std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+int main(int argc, char* argv[]) {
+
+    // Check command line arguments.
+    if (argc != 2)
+    {
+        std::cerr << "Usage: server <threads>\n" ;
+        return EXIT_FAILURE;
     }
+    auto const threads = std::max<int>(1, std::atoi(argv[1]));
+
+    // The io_context is required for all I/O
+    asio::io_context ioc{threads};
+
+    // Create and launch a listening port
+    std::make_shared<ProxyServer>(ioc, 8080)->do_accept();
+
+    // Run the I/O service on the requested number of threads
+    std::vector<std::thread> v;
+    v.reserve(threads - 1);
+    for(auto i = threads - 1; i > 0; --i)
+        v.emplace_back(
+        [&ioc, i]
+        {
+            std::cout << "thread " << i << "is running" << std::endl;
+            ioc.run();
+        });
+
+    ioc.run();
+
+    
+
     return 0;
 }
