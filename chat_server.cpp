@@ -6,7 +6,6 @@
 #include <thread>
 #include <vector>
 
-
 namespace asio = boost::asio;
 namespace http = boost::beast::http;
 using tcp = asio::ip::tcp;
@@ -17,15 +16,16 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
     tcp::socket target_socket_;
     boost::beast::flat_static_buffer<8192> buffer_;
     http::request_parser<http::empty_body> parser_;
-    http::request<http::string_body> req_;
     
     // Буферы для перекачки данных (bridge)
     std::array<char, 8192> client_to_target_buf_;
     std::array<char, 8192> target_to_client_buf_;
 
 public:
+    // Теперь socket уже имеет привязанный strand (созданный в ProxyServer)
     ProxySession(tcp::socket socket) 
         : client_socket_(std::move(socket)), 
+          // Инициализируем target_socket_ тем же экзекутором (strand-ом), что и client_socket_
           target_socket_(client_socket_.get_executor()) {}
 
     void start() {
@@ -35,9 +35,11 @@ public:
 private:
     void read_http_header() {
         auto self = shared_from_this();
+        // Все асинхронные вызовы автоматически используют strand сокета
         http::async_read_header(client_socket_, buffer_, parser_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->on_header_read();
+                else self->close();
             });
     }
 
@@ -45,7 +47,6 @@ private:
         auto req = parser_.get();
         std::string host_header = req[http::field::host];
         
-        // Базовый парсинг хоста и порта
         std::string host = host_header;
         std::string port = (req.method() == http::verb::connect) ? "443" : "80";
 
@@ -56,12 +57,14 @@ private:
 
         std::cout << "Connect to: " << host << ":" << port << std::endl;
 
-        // Резолвим адрес
+        // Важно: передаем strand клиентского сокета в резолвер, 
+        // чтобы его коллбэки тоже выполнялись в потокобезопасном контексте
         auto resolver = std::make_shared<tcp::resolver>(client_socket_.get_executor());
         auto self = shared_from_this();
         resolver->async_resolve(host, port,
             [self, resolver, req](boost::system::error_code ec, tcp::resolver::results_type results) {
                 if (!ec) self->connect_to_target(results, req);
+                else self->close();
             });
     }
 
@@ -69,12 +72,14 @@ private:
         auto self = shared_from_this();
         asio::async_connect(target_socket_, endpoints,
             [self, req](boost::system::error_code ec, const tcp::endpoint&) {
-                if (ec) return;
-
-                if (req.method() == http::verb::connect) {
-                    self->send_connect_ok();
+                if (!ec) {
+                    if (req.method() == http::verb::connect) {
+                        self->send_connect_ok();
+                    } else {
+                        self->forward_http_request(req);
+                    }
                 } else {
-                    self->forward_http_request(req);
+                    self->close();
                 }
             });
     }
@@ -85,20 +90,20 @@ private:
         asio::async_write(client_socket_, asio::buffer(*response),
             [self, response](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->start_bridge();
+                else self->close();
             });
     }
 
     void forward_http_request(http::request<http::empty_body> req) {
         auto self = shared_from_this();
-        // Используем shared_ptr для req, чтобы он жил до конца отправки
         auto req_ptr = std::make_shared<http::request<http::empty_body>>(std::move(req));
         http::async_write(target_socket_, *req_ptr,
             [self, req_ptr](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->start_bridge();
+                else self->close();
             });
     }
 
-    // Запускаем двустороннюю перекачку
     void start_bridge() {
         do_read_client();
         do_read_target();
@@ -112,6 +117,7 @@ private:
                     asio::async_write(self->target_socket_, asio::buffer(self->client_to_target_buf_, n),
                         [self](boost::system::error_code ec, std::size_t) {
                             if (!ec) self->do_read_client();
+                            else self->close();
                         });
                 } else { self->close(); }
             });
@@ -125,14 +131,24 @@ private:
                     asio::async_write(self->client_socket_, asio::buffer(self->target_to_client_buf_, n),
                         [self](boost::system::error_code ec, std::size_t) {
                             if (!ec) self->do_read_target();
+                            else self->close();
                         });
                 } else { self->close(); }
             });
     }
 
     void close() {
-        if (client_socket_.is_open()) client_socket_.close();
-        if (target_socket_.is_open()) target_socket_.close();
+        // Делаем close безопасным. Поскольку мы используем strand,
+        // эта функция никогда не вызовется дважды одновременно.
+        boost::system::error_code ec;
+        if (client_socket_.is_open()) {
+            client_socket_.shutdown(tcp::socket::shutdown_both, ec);
+            client_socket_.close(ec);
+        }
+        if (target_socket_.is_open()) {
+            target_socket_.shutdown(tcp::socket::shutdown_both, ec);
+            target_socket_.close(ec);
+        }
     }
 };
 
@@ -145,46 +161,43 @@ public:
         : acceptor_(ctx, {tcp::v4(), port}) { }
 
     void do_accept() {
-        acceptor_.async_accept(
+        // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Создаем новый strand для каждого входящего соединения
+        auto session_strand = asio::make_strand(acceptor_.get_executor());
+        
+        // Передаем strand в async_accept. 
+        // Сформированный tcp::socket будет "привязан" к этому strand.
+        acceptor_.async_accept(session_strand,
             [self = shared_from_this()](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
                     std::make_shared<ProxySession>(std::move(socket))->start();
                 }
-               self->do_accept();
+                self->do_accept();
             });
     }
 };
 
 int main(int argc, char* argv[]) {
-
-    // Check command line arguments.
-    if (argc != 2)
-    {
+    if (argc != 2) {
         std::cerr << "Usage: server <threads>\n" ;
         return EXIT_FAILURE;
     }
     auto const threads = std::max<int>(1, std::atoi(argv[1]));
 
-    // The io_context is required for all I/O
     asio::io_context ioc{threads};
 
-    // Create and launch a listening port
     std::make_shared<ProxyServer>(ioc, 8080)->do_accept();
 
-    // Run the I/O service on the requested number of threads
     std::vector<std::thread> v;
     v.reserve(threads - 1);
     for(auto i = threads - 1; i > 0; --i)
         v.emplace_back(
         [&ioc, i]
         {
-            std::cout << "thread " << i << "is running" << std::endl;
+            std::cout << "thread " << i << " is running" << std::endl;
             ioc.run();
         });
 
     ioc.run();
-
-    
 
     return 0;
 }
