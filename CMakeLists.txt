@@ -1,29 +1,34 @@
-cmake_minimum_required(VERSION 3.10)
-project(BoostAsioProxy)
+# Требуем минимум CMake 3.16 для поддержки предварительно скомпилированных заголовков
+cmake_minimum_required(VERSION 3.16)
 
-# Стандарт C++
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+project(BoostAsioProxy LANGUAGES CXX)
 
-# Поиск Boost (Asio обычно требует System и Date_Time)
-find_package(Boost REQUIRED COMPONENTS system date_time beast json)
 
-if(Boost_FOUND)
-    add_executable(server chat_server.cpp)
-    target_include_directories(server 
-    PUBLIC ${Boost_INCLUDE_DIRS}
-    )
-    
-    # Линковка Boost и системных библиотек Windows для сокетов (ws2_32 и mswsock)
-    target_link_libraries(server
-        PRIVATE 
-        Boost::system 
-        Boost::beast
+find_package(Boost REQUIRED COMPONENTS system)
+
+# Добавляем наш исполняемый файл
+add_executable(server chat_server.cpp lru_cache.h)
+
+
+target_compile_features(server PUBLIC cxx_std_17)
+
+
+target_precompile_headers(server PRIVATE 
+    <boost/asio.hpp>
+    <boost/beast.hpp>
+    <boost/json.hpp> 
+)
+
+
+target_link_libraries(server
+    PRIVATE
+        
+        Boost::headers
+        
+        # Линкуем скомпилированный компонент
+        Boost::system
+        
+        # Системные библиотеки Windows (подключаются только если собираем под Windows)
         $<$<PLATFORM_ID:Windows>:ws2_32>
         $<$<PLATFORM_ID:Windows>:mswsock>
-    )
-
-   
-else()
-    message(FATAL_ERROR "Boost не найден! Проверьте установку в MSYS2.")
-endif()
+)
