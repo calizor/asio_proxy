@@ -1,51 +1,47 @@
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp> // <-- ДОБАВИЛИ SSL
 #include <boost/beast/http.hpp>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
-#include "lru_cache.h"
+#include <optional>
 
 namespace asio = boost::asio;
+namespace ssl = boost::asio::ssl; // <-- Неймспейс SSL
 namespace http = boost::beast::http;
 using tcp = asio::ip::tcp;
 
-
-
-// ==========================================
-// 2. Логика сессии (с поддержкой кэширования)
-// ==========================================
 class ProxySession : public std::enable_shared_from_this<ProxySession> {
     tcp::socket client_socket_;
     tcp::socket target_socket_;
-    std::shared_ptr<LRUCache> cache_; // Указатель на глобальный кэш
+    std::shared_ptr<ssl::context> ssl_ctx_; // <-- Храним SSL контекст
     
-    boost::beast::flat_static_buffer<8192> buffer_;
-    http::request_parser<http::empty_body> parser_;
-    
-    // Переменные для чтения ответа при Cache Miss
-    std::string cache_key_;
-    boost::beast::multi_buffer target_buffer_;
-    http::response<http::string_body> target_res_;
+    // Стрим для перехваченного защищенного соединения
+    std::optional<ssl::stream<tcp::socket&>> client_ssl_stream_;
 
-    std::array<char, 8192> client_to_target_buf_;
-    std::array<char, 8192> target_to_client_buf_;
+    boost::beast::flat_static_buffer<8192> buffer_;
+    
+    // Делаем парсер опциональным, чтобы его можно было сбросить 
+    // перед чтением расшифрованного запроса
+    std::optional<http::request_parser<http::string_body>> parser_;
 
 public:
-    ProxySession(tcp::socket socket, std::shared_ptr<LRUCache> cache) 
+    ProxySession(tcp::socket socket, std::shared_ptr<ssl::context> ssl_ctx) 
         : client_socket_(std::move(socket)), 
           target_socket_(client_socket_.get_executor()),
-          cache_(std::move(cache)) {}
+          ssl_ctx_(std::move(ssl_ctx)) {}
 
     void start() {
+        parser_.emplace(); // Инициализируем парсер
         read_http_header();
     }
 
 private:
     void read_http_header() {
         auto self = shared_from_this();
-        http::async_read_header(client_socket_, buffer_, parser_,
+        http::async_read_header(client_socket_, buffer_, *parser_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->on_header_read();
                 else self->close();
@@ -53,157 +49,84 @@ private:
     }
 
     void on_header_read() {
-        auto req = parser_.get();
+        auto req = parser_->get();
         std::string host_header = req[http::field::host];
         
-        std::string host = host_header;
-        std::string port = (req.method() == http::verb::connect) ? "443" : "80";
-
-        if (size_t pos = host_header.find(':'); pos != std::string::npos) {
-            host = host_header.substr(0, pos);
-            port = host_header.substr(pos + 1);
+        // [MITM] Если это HTTPS запрос (CONNECT)
+        if (req.method() == http::verb::connect) {
+            std::cout << "\n[MITM] Intercepted CONNECT to: " << host_header << "\n";
+            send_connect_ok();
+            return;
         }
 
-        // --- ЛОГИКА КЭШИРОВАНИЯ ДЛЯ GET-ЗАПРОСОВ ---
-        if (req.method() == http::verb::get) {
-            // Формируем уникальный ключ кэша (Host + URI)
-            cache_key_ = host + std::string(req.target());
-            
-            auto cached_response = cache_->get(cache_key_);
-            if (cached_response) {
-                std::cout << "[CACHE HIT] " << cache_key_ << "\n";
-                send_cached_response(*cached_response);
-                return; // Завершаем обработку, так как данные взяты из кэша
-            }
-            std::cout << "[CACHE MISS] " << cache_key_ << " -> Fetching...\n";
-        } else {
-            std::cout << "[TUNNEL] Connect to: " << host << ":" << port << "\n";
-        }
-        // ------------------------------------------
-
-        auto resolver = std::make_shared<tcp::resolver>(client_socket_.get_executor());
-        auto self = shared_from_this();
-        resolver->async_resolve(host, port,
-            [self, resolver, req](boost::system::error_code ec, tcp::resolver::results_type results) {
-                if (!ec) self->connect_to_target(results, req);
-                else self->close();
-            });
+        // Если это обычный HTTP, просто закрываем (пока нас интересует только HTTPS)
+        std::cout << "Ignoring regular HTTP request to: " << host_header << "\n";
+        close();
     }
 
-    // Отправка готовых данных (из кэша или только что прочитанных) клиенту
-    void send_cached_response(const std::string& data) {
-        auto self = shared_from_this();
-        auto res_data = std::make_shared<std::string>(data);
-        asio::async_write(client_socket_, asio::buffer(*res_data),
-            [self, res_data](boost::system::error_code ec, std::size_t) {
-                self->close(); // Закрываем соединение после отправки ответа
-            });
-    }
-
-    void connect_to_target(tcp::resolver::results_type endpoints, http::request<http::empty_body> req) {
-        auto self = shared_from_this();
-        asio::async_connect(target_socket_, endpoints,
-            [self, req](boost::system::error_code ec, const tcp::endpoint&) {
-                if (!ec) {
-                    if (req.method() == http::verb::connect) {
-                        self->send_connect_ok();
-                    } else if (req.method() == http::verb::get) {
-                        // Для GET запроса запускаем цикл чтения-кэширования
-                        self->forward_and_cache_get_request(req);
-                    } else {
-                        // Для POST и других пересылаем слепо
-                        self->forward_http_request(req);
-                    }
-                } else {
-                    self->close();
-                }
-            });
-    }
-
-    // --- ФАЗА 1: Пересылка запроса серверу ---
-    void forward_and_cache_get_request(http::request<http::empty_body> req) {
-        auto self = shared_from_this();
-        auto req_ptr = std::make_shared<http::request<http::empty_body>>(std::move(req));
-        http::async_write(target_socket_, *req_ptr,
-            [self, req_ptr](boost::system::error_code ec, std::size_t) {
-                if (!ec) self->read_response_from_target();
-                else self->close();
-            });
-    }
-
-    // --- ФАЗА 2: Чтение ответа сервера, сохранение и отправка клиенту ---
-    void read_response_from_target() {
-        auto self = shared_from_this();
-        http::async_read(target_socket_, target_buffer_, target_res_,
-            [self](boost::system::error_code ec, std::size_t) {
-                if (!ec) {
-                    // Сериализуем HTTP-ответ в строку
-                    std::stringstream ss;
-                    ss << self->target_res_;
-                    std::string res_str = ss.str();
-                    
-                    // Кладем в LRU кэш
-                    self->cache_->put(self->cache_key_, res_str);
-                    
-                    // Отправляем клиенту
-                    self->send_cached_response(res_str);
-                } else {
-                    self->close();
-                }
-            });
-    }
-
-    // --- Старые методы туннелирования для HTTPS (CONNECT) ---
     void send_connect_ok() {
         auto self = shared_from_this();
         auto response = std::make_shared<std::string>("HTTP/1.1 200 Connection Established\r\n\r\n");
+        
+        // Отправляем браузеру подтверждение в открытом виде
         asio::async_write(client_socket_, asio::buffer(*response),
             [self, response](boost::system::error_code ec, std::size_t) {
-                if (!ec) self->start_bridge();
-                else self->close();
-            });
-    }
-
-    void forward_http_request(http::request<http::empty_body> req) {
-        auto self = shared_from_this();
-        auto req_ptr = std::make_shared<http::request<http::empty_body>>(std::move(req));
-        http::async_write(target_socket_, *req_ptr,
-            [self, req_ptr](boost::system::error_code ec, std::size_t) {
-                if (!ec) self->start_bridge();
-                else self->close();
-            });
-    }
-
-    void start_bridge() {
-        do_read_client();
-        do_read_target();
-    }
-
-    void do_read_client() {
-        auto self = shared_from_this();
-        client_socket_.async_read_some(asio::buffer(client_to_target_buf_),
-            [self](boost::system::error_code ec, std::size_t n) {
                 if (!ec) {
-                    asio::async_write(self->target_socket_, asio::buffer(self->client_to_target_buf_, n),
-                        [self](boost::system::error_code ec, std::size_t) {
-                            if (!ec) self->do_read_client();
-                            else self->close();
+                    // [MITM] Браузер думает, что туннель готов. Сейчас он начнет слать шифрованные байты.
+                    // Оборачиваем наш сырой сокет в SSL-стрим!
+                    self->client_ssl_stream_.emplace(self->client_socket_, *self->ssl_ctx_);
+                    
+                    // Выполняем "рукопожатие" (Handshake), выступая в роли сервера
+                    self->client_ssl_stream_->async_handshake(ssl::stream_base::server,
+                        [self](boost::system::error_code ec) {
+                            if (!ec) {
+                                std::cout << "[MITM] SSL Handshake successful! Reading decrypted data...\n";
+                                self->read_decrypted_request();
+                            } else {
+                                std::cerr << "[MITM] Handshake failed: " << ec.message() << "\n";
+                                self->close();
+                            }
                         });
-                } else { self->close(); }
+                } else self->close();
             });
     }
 
-    void do_read_target() {
+    void read_decrypted_request() {
         auto self = shared_from_this();
-        target_socket_.async_read_some(asio::buffer(target_to_client_buf_),
-            [self](boost::system::error_code ec, std::size_t n) {
+        
+        // Сбрасываем парсер, чтобы прочитать новый (уже расшифрованный) запрос
+        parser_.emplace();
+        
+        // ВАЖНО: Теперь мы читаем из client_ssl_stream_, а не из client_socket_!
+        http::async_read(*client_ssl_stream_, buffer_, *parser_,
+            [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    asio::async_write(self->client_socket_, asio::buffer(self->target_to_client_buf_, n),
-                        [self](boost::system::error_code ec, std::size_t) {
-                            if (!ec) self->do_read_target();
-                            else self->close();
-                        });
-                } else { self->close(); }
+                    auto req = self->parser_->get();
+                    std::cout << "[MITM] SUCCESS! Decrypted request: " << req.method_string() << " " << req.target() << "\n";
+                    
+                    // Отдаем браузеру фейковую страницу через зашифрованный туннель
+                    self->send_fake_ssl_response();
+                } else {
+                    self->close();
+                }
+            });
+    }
+
+    void send_fake_ssl_response() {
+        auto self = shared_from_this();
+        
+        // Формируем обычный HTTP ответ
+        auto res = std::make_shared<http::response<http::string_body>>(http::status::ok, 11);
+        res->set(http::field::server, "MyMITMProxy");
+        res->set(http::field::content_type, "text/html");
+        res->body() = "<h1>Hello from MITM Proxy!</h1><p>I decrypted your HTTPS traffic!</p>";
+        res->prepare_payload();
+
+        // Пишем в SSL-стрим (OpenSSL сам зашифрует эти данные перед отправкой в сеть)
+        http::async_write(*client_ssl_stream_, *res,
+            [self, res](boost::system::error_code ec, std::size_t) {
+                std::cout << "[MITM] Fake response sent. Closing connection.\n";
+                self->close();
             });
     }
 
@@ -213,30 +136,23 @@ private:
             client_socket_.shutdown(tcp::socket::shutdown_both, ec);
             client_socket_.close(ec);
         }
-        if (target_socket_.is_open()) {
-            target_socket_.shutdown(tcp::socket::shutdown_both, ec);
-            target_socket_.close(ec);
-        }
     }
 };
 
-// ==========================================
-// 3. Сервер
-// ==========================================
 class ProxyServer : public std::enable_shared_from_this<ProxyServer>{
     tcp::acceptor acceptor_;
-    std::shared_ptr<LRUCache> cache_;
+    std::shared_ptr<ssl::context> ssl_ctx_;
 
 public:
-    ProxyServer(asio::io_context& ctx, unsigned short port, std::shared_ptr<LRUCache> cache)
-        : acceptor_(ctx, {tcp::v4(), port}), cache_(std::move(cache)) { }
+    ProxyServer(asio::io_context& ctx, unsigned short port, std::shared_ptr<ssl::context> ssl_ctx)
+        : acceptor_(ctx, {tcp::v4(), port}), ssl_ctx_(std::move(ssl_ctx)) { }
 
     void do_accept() {
         auto session_strand = asio::make_strand(acceptor_.get_executor());
         acceptor_.async_accept(session_strand,
             [self = shared_from_this()](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
-                    std::make_shared<ProxySession>(std::move(socket), self->cache_)->start();
+                    std::make_shared<ProxySession>(std::move(socket), self->ssl_ctx_)->start();
                 }
                 self->do_accept();
             });
@@ -249,31 +165,38 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
     auto const threads = std::max<int>(1, std::atoi(argv[1]));
-
     asio::io_context ioc{threads};
 
-    // Создаем глобальный кэш на 1000 записей
-    auto shared_cache = std::make_shared<LRUCache>(1000);
+    // --- НАСТРОЙКА SSL КОНТЕКСТА ДЛЯ СЕРВЕРА ---
+    auto ssl_ctx = std::make_shared<ssl::context>(ssl::context::tls_server);
+    ssl_ctx->set_options(
+        ssl::context::default_workarounds |
+        ssl::context::no_sslv2 |
+        ssl::context::no_sslv3 |
+        ssl::context::no_tlsv1 |
+        ssl::context::no_tlsv1_1
+    );
+    
+    // Подгружаем наши сгенерированные сертификаты
+   try {
+        ssl_ctx->use_certificate_chain_file("google.crt");
+        ssl_ctx->use_private_key_file("google.key", ssl::context::pem);
+    } catch (std::exception& e) {
+        std::cerr << "CRITICAL ERROR: " << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
 
-    // Передаем кэш в сервер
-    std::make_shared<ProxyServer>(ioc, 8080, shared_cache)->do_accept();
+    std::make_shared<ProxyServer>(ioc, 8080, ssl_ctx)->do_accept();
 
     std::vector<std::thread> v;
     v.reserve(threads - 1);
     for(auto i = threads - 1; i > 0; --i)
-        v.emplace_back(
-        [&ioc, i] {
-            std::cout << "thread " << i << " is running\n";
-            ioc.run();
-        });
+        v.emplace_back([&ioc] { ioc.run(); });
 
     ioc.run();
 
-    // Ждем завершения потоков (исправление потенциального краша)
     for (auto& t : v) {
-        if (t.joinable()) {
-            t.join(); 
-        }
+        if (t.joinable()) t.join(); 
     }
 
     return 0;
