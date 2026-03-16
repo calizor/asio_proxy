@@ -97,16 +97,32 @@ private:
 
         if (!ca_cert || !ca_pkey) return false;
 
-        // --- 2. Генерируем новый приватный ключ для домена (RSA 2048) ---
-        EVP_PKEY* pkey = EVP_PKEY_new();
-        RSA* rsa = RSA_generate_key(2048, RSA_F4, nullptr, nullptr);
-        EVP_PKEY_assign_RSA(pkey, rsa);
+       // --- 2. Генерируем новый приватный ключ (Современный EVP API) ---
+        EVP_PKEY* pkey = nullptr;
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+        
+        if (pctx) {
+            if (EVP_PKEY_keygen_init(pctx) > 0 && 
+                EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) > 0) {
+                EVP_PKEY_keygen(pctx, &pkey);
+            }
+            EVP_PKEY_CTX_free(pctx);
+        }
+
+        if (!pkey) {
+            X509_free(ca_cert);
+            EVP_PKEY_free(ca_pkey);
+            return false;
+        }
 
         // --- 3. Создаем новый сертификат ---
         X509* x509 = X509_new();
+        // ВАЖНО: Указываем версию X.509 v3 (цифра 2), чтобы Chrome не ругался на формат!
+        X509_set_version(x509, 2); 
+        
         ASN1_INTEGER_set(X509_get_serialNumber(x509), 1); // Серийный номер
-        X509_gmtime_adj(X509_get_notBefore(x509), 0);     // Действителен с текущего момента
-        X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // Действителен 1 год (в секундах)
+        X509_gmtime_adj(X509_get_notBefore(x509), -10000);     // Действителен с текущего момента
+        X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // Действителен 1 год
         X509_set_pubkey(x509, pkey);
 
         // --- 4. Задаем Имя субъекта (Common Name) ---
