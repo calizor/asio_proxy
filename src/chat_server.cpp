@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "proxy_server.h" // Подключаем только сервер!
+#include "lru_cache.h"
 
 namespace asio = boost::asio;
 
@@ -18,9 +19,11 @@ int main(int argc, char* argv[]) {
     auto const threads = std::max<int>(1, std::atoi(argv[1]));
     asio::io_context ioc{threads};
 
-    // Запускаем сервер на порту 8080
-    std::make_shared<ProxyServer>(ioc, 8080)->do_accept();
+    auto global_cache = std::make_shared<LRUCache>(1000);
 
+    // Запускаем сервер на порту 8080
+    std::make_shared<ProxyServer>(ioc, 8080, global_cache)->do_accept();
+    
     // Создаем пул потоков
     std::vector<std::thread> v;
     v.reserve(threads - 1);

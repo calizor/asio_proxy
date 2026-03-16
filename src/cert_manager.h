@@ -13,23 +13,69 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 
+#include <boost/asio/ssl.hpp> // Подключаем SSL из Boost
+
 class CertManager {
+    static inline std::mutex cert_mutex_;
+    // КЭШ L1: Хранит готовые к работе SSL-контексты прямо в ОЗУ
+    static inline std::unordered_map<std::string, std::shared_ptr<boost::asio::ssl::context>> ctx_cache_;
+
 public:
-    static bool prepare_cert_for_domain(const std::string& domain, std::string& out_crt, std::string& out_key) {
+    // Теперь функция возвращает ГОТОВЫЙ КОНТЕКСТ, а не пути к файлам
+    static std::shared_ptr<boost::asio::ssl::context> get_context_for_domain(const std::string& domain) {
+        
+        // --- 1. БЫСТРАЯ ПРОВЕРКА В ОЗУ (Double-Checked Locking, шаг 1) ---
+        {
+            std::lock_guard<std::mutex> lock(cert_mutex_);
+            auto it = ctx_cache_.find(domain);
+            if (it != ctx_cache_.end()) {
+                return it->second; // МГНОВЕННЫЙ ВОЗВРАТ! Никакого диска.
+            }
+        }
+
+        // --- 2. БЛОКИРУЕМ ПОТОК ДЛЯ РАБОТЫ С ДИСКОМ ---
+        std::lock_guard<std::mutex> lock(cert_mutex_);
+
+        // ПОВТОРНАЯ ПРОВЕРКА (вдруг другой поток уже создал контекст, пока мы ждали мьютекс)
+        if (ctx_cache_.find(domain) != ctx_cache_.end()) {
+            return ctx_cache_[domain];
+        }
+
         std::string cert_dir = "certs/";
         if (!std::filesystem::exists(cert_dir)) {
             std::filesystem::create_directory(cert_dir);
         }
 
-        out_crt = cert_dir + domain + ".crt";
-        out_key = cert_dir + domain + ".key";
+        std::string out_crt = cert_dir + domain + ".crt";
+        std::string out_key = cert_dir + domain + ".key";
 
-        if (std::filesystem::exists(out_crt) && std::filesystem::exists(out_key)) {
-            return true; // Сертификат уже в кэше файлов
+        // --- 3. ГЕНЕРАЦИЯ, ЕСЛИ НЕТ НА ДИСКЕ ---
+        if (!std::filesystem::exists(out_crt) || !std::filesystem::exists(out_key)) {
+            std::cout << "[CERT] Generating new certificate for: " << domain << "...\n";
+            if (!generate_x509(domain, out_crt, out_key, "rootCA.crt", "rootCA.key")) {
+                std::cerr << "[CERT] Critical error: failed to generate X509!\n";
+                return nullptr;
+            }
         }
 
-        std::cout << "[CERT] Generating new certificate for: " << domain << " using OpenSSL API...\n";
-        return generate_x509(domain, out_crt, out_key, "rootCA.crt", "rootCA.key");
+        // --- 4. СОБИРАЕМ КОНТЕКСТ И СОХРАНЯЕМ В ОЗУ ---
+        auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+        ctx->set_options(boost::asio::ssl::context::default_workarounds |
+                         boost::asio::ssl::context::no_sslv2 |
+                         boost::asio::ssl::context::no_sslv3);
+        
+        try {
+            ctx->use_certificate_chain_file(out_crt);
+            ctx->use_private_key_file(out_key, boost::asio::ssl::context::pem);
+        } catch (const std::exception& e) {
+            std::cerr << "[CERT] Failed to load certs into context: " << e.what() << "\n";
+            return nullptr;
+        }
+
+        // Кладём в оперативную память для будущих запросов
+        ctx_cache_[domain] = ctx;
+        
+        return ctx;
     }
 
 private:
