@@ -4,9 +4,11 @@
 #include <vector>
 #include <cstdlib>
 #include <algorithm>
+#include <boost/asio/signal_set.hpp> 
 
-#include "proxy_server.h" // Подключаем только сервер!
-#include "lru_cache.h"
+#include "proxy_server.hpp" // Подключаем только сервер!
+#include "lru_cache.hpp"
+#define PORT 8080
 
 namespace asio = boost::asio;
 
@@ -22,8 +24,21 @@ int main(int argc, char* argv[]) {
     auto global_cache = std::make_shared<LRUCache>(1000);
 
     // Запускаем сервер на порту 8080
-    std::make_shared<ProxyServer>(ioc, 8080, global_cache)->do_accept();
+    std::make_shared<ProxyServer>(ioc, PORT, global_cache)->do_accept();
     
+    asio::signal_set signals(ioc, SIGINT, SIGTERM);
+    
+    // Асинхронно ждем нажатия Ctrl+C
+    signals.async_wait(
+        [&ioc](boost::system::error_code const& ec, int signal_number) {
+            if (!ec) {
+                std::cout << "\n[SERVER] Получен сигнал (Ctrl+C). Остановка серверов...\n";
+                // Вот теперь мы легально останавливаем бесконечный цикл!
+                ioc.stop(); 
+            }
+        });
+
+
     // Создаем пул потоков
     std::vector<std::thread> v;
     v.reserve(threads - 1);
@@ -36,6 +51,8 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Main thread is running\n";
     ioc.run();
+
+    
 
     // Корректное завершение потоков, только до сюда не доходит, ioc.run() бесконечный до ioc.stop()(наверное);
     for (auto& t : v) {

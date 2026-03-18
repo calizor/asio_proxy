@@ -3,14 +3,16 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <optional>
 #include <sstream>
 
-#include "cert_manager.h"
-#include "lru_cache.h" 
+
+#include "cert_manager.hpp"
+#include "lru_cache.hpp" 
 
 namespace asio = boost::asio;
 namespace ssl = boost::asio::ssl;
@@ -32,7 +34,7 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
     std::optional<ssl::stream<tcp::socket&>> target_ssl_stream_;
 
     // Буфер и парсеры
-    boost::beast::flat_static_buffer<8192> buffer_;
+    boost::beast::flat_buffer buffer_;
     std::optional<http::request_parser<http::string_body>> parser_;
     
     // Хранилище для запроса и ответа
@@ -43,26 +45,44 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
     std::string cache_key_;
     std::string target_domain_;
 
+    boost::asio::steady_timer deadline_;
+
 public:
     ProxySession(tcp::socket socket, std::shared_ptr<LRUCache> cache = nullptr) 
         : client_socket_(std::move(socket)), 
           target_socket_(client_socket_.get_executor()),
           resolver_(client_socket_.get_executor()),
-          cache_(cache) {
+          cache_(cache),
+          deadline_(socket.get_executor()) {
         
         // Настраиваем SSL-клиента (чтобы прокси доверял серверам в интернете)
         target_ssl_ctx_.set_default_verify_paths();
     }
 
     void start() {
+        start_timer();
         parser_.emplace();
         read_http_header();
     }
 
+
+    void start_timer() {
+        auto self = shared_from_this();
+        // Ждем истечения таймера
+        deadline_.async_wait([self](boost::system::error_code ec) {
+            // Ошибка operation_aborted означает, что таймер был СБРОШЕН (перезапущен).
+            // Если ошибки нет - значит время реально вышло!
+            if (!ec) {
+                std::cout << "[TIMEOUT] Сессия неактивна, закрываем соединение!\n";
+                self->close(); // Жестко рубим сокеты
+            }
+        });
+}
+
 private:
     void read_http_header() {
         auto self = shared_from_this();
-        http::async_read_header(client_socket_, buffer_, *parser_,
+        http::async_read_header(client_socket_, buffer_, *parser_, //у optional перегружен оператор *; same as parser_.value();
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->on_header_read();
                 else self->close();
@@ -75,14 +95,14 @@ private:
         
         if (req.method() == http::verb::connect) {
             target_domain_ = host_header;
-            if (size_t pos = target_domain_.find(':'); pos != std::string::npos) {
+            if (size_t pos = target_domain_.find(':'); pos != std::string::npos) { // if statement with initializer, pos lives in if and else block
                 target_domain_ = target_domain_.substr(0, pos);
             }
             std::cout << "\n[MITM] Intercepted CONNECT to: " << target_domain_ << "\n";
             send_connect_ok();
         } else {
             // Здесь можно добавить обработку обычного HTTP, но пока закроем
-            close(); 
+            close();
         }
     }
 
@@ -121,6 +141,9 @@ private:
         auto self = shared_from_this();
         parser_.emplace(); // Сбрасываем парсер для нового чтения
         
+        deadline_.expires_after(std::chrono::seconds(30));      //таймер сессии
+        start_timer();
+
         http::async_read(*client_ssl_stream_, buffer_, *parser_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
@@ -145,9 +168,9 @@ private:
                 send_cached_response(*cached_body);
                 return;
             }
+           std::cout << "[CACHE MISS] Fetching from " << target_domain_ << "...\n";
         }
 
-        std::cout << "[CACHE MISS] Fetching from " << target_domain_ << "...\n";
         resolve_target();
     }
 
@@ -161,11 +184,19 @@ private:
         // Пишем сырую строку напрямую в SSL-стрим браузера (Boost Asio сам всё поймет)
         asio::async_write(*client_ssl_stream_, asio::buffer(*res_ptr),
             [self, res_ptr](boost::system::error_code ec, std::size_t) {
-                self->close();
-            });
+                if (ec) {
+                    self->close();
+                    return;
+                }
+                if (self->current_req_.keep_alive()) {
+                    self->read_decrypted_request(); 
+                } else {
+                    self->close(); 
+                }
+        });
     }
 
-    // --- ШАГ 4: Подключение к целевому серверу (Google/VK) ---
+    // ---ШАГ 4: Подключение к целевому серверу---
     void resolve_target() {
         auto self = shared_from_this();
         resolver_.async_resolve(target_domain_, "443",
@@ -216,7 +247,6 @@ private:
         http::async_read(*target_ssl_stream_, buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    // [ИЗМЕНЕНИЕ ЗДЕСЬ]
                     if (self->current_req_.method() == http::verb::get && self->cache_ != nullptr) {
                         // Сериализуем ВЕСЬ HTTP-ответ (заголовки + тело) в строку
                         std::ostringstream oss;

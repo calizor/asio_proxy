@@ -1,5 +1,5 @@
 # Требуем минимум CMake 3.16 для поддержки предварительно скомпилированных заголовков
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.30)
 
 project(BoostAsioProxy LANGUAGES CXX)
 
@@ -7,11 +7,11 @@ find_package(Boost REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_executable(server 
-    src/chat_server.cpp 
-    src/proxy_server.h 
-    src/proxy_session.h 
-    src/cert_manager.h
-    src/lru_cache.h
+    src/main.cpp 
+    src/proxy_server.hpp
+    src/proxy_session.hpp 
+    src/cert_manager.hpp
+    src/lru_cache.hpp
 )
 
 target_compile_features(server PUBLIC cxx_std_17)

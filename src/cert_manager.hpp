@@ -121,7 +121,7 @@ private:
         X509_set_version(x509, 2); 
         
         ASN1_INTEGER_set(X509_get_serialNumber(x509), 1); // Серийный номер
-        X509_gmtime_adj(X509_get_notBefore(x509), -10000);     // Действителен с текущего момента
+        X509_gmtime_adj(X509_get_notBefore(x509), -10000);     // Действителен с прошлого(нужно для того, чтобы если рассинхрон по времени, браузер не ругался)
         X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // Действителен 1 год
         X509_set_pubkey(x509, pkey);
 

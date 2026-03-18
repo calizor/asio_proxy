@@ -2,8 +2,8 @@
 
 #include <boost/asio.hpp>
 #include <memory>
-#include "proxy_session.h" 
-#include "lru_cache.h"
+#include "proxy_session.hpp" 
+#include "lru_cache.hpp"
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
