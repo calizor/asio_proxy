@@ -269,9 +269,21 @@ private:
         auto res_ptr = std::make_shared<http::response<http::string_body>>(std::move(current_res_));
         
         http::async_write(*client_ssl_stream_, *res_ptr,
-            [self, res_ptr](boost::system::error_code ec, std::size_t) {
+        [self, res_ptr](boost::system::error_code ec, std::size_t) {
+            // 1. Если при отправке произошла ошибка (например, юзер закрыл вкладку)
+            if (ec) {
                 self->close();
-            });
+                return;
+            }
+
+            if (res_ptr->keep_alive()) {
+                self->read_decrypted_request(); 
+            } else {
+                // Закрываем только если браузер или сервер прямо попросили об этом 
+                // (например, прислали заголовок Connection: close)
+                self->close();
+            }
+        });
     }
 
     void close() {
