@@ -53,7 +53,7 @@ public:
           target_socket_(client_socket_.get_executor()),
           resolver_(client_socket_.get_executor()),
           cache_(cache),
-          deadline_(socket.get_executor()) {
+          deadline_(socket.get_executor(),std::chrono::seconds(30)) {
         
         // Настраиваем SSL-клиента (чтобы прокси доверял серверам в интернете)
         target_ssl_ctx_.set_default_verify_paths();
@@ -70,11 +70,14 @@ public:
         auto self = shared_from_this();
         // Ждем истечения таймера
         deadline_.async_wait([self](boost::system::error_code ec) {
-            // Ошибка operation_aborted означает, что таймер был СБРОШЕН (перезапущен).
-            // Если ошибки нет - значит время реально вышло!
+            // 1. Проверяем, не отменили ли таймер ручным сбросом
+            if (ec == boost::asio::error::operation_aborted) {
+                return; // Всё отлично, таймер просто перезапустили, ничего не закрываем!
+            }
+            // 2. Если другой ошибки нет, значит время реально вышло
             if (!ec) {
-                std::cout << "[TIMEOUT] Сессия неактивна, закрываем соединение!\n";
-                self->close(); // Жестко рубим сокеты
+                std::cout << "[TIMEOUT] Время вышло, закрываем сокет. "<< self->target_domain_ << "\n";
+                self->close();
             }
         });
 }
