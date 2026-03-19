@@ -34,7 +34,8 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
     std::optional<ssl::stream<tcp::socket&>> target_ssl_stream_;
 
     // Буфер и парсеры
-    boost::beast::flat_buffer buffer_;
+    boost::beast::flat_buffer client_buffer_; 
+    boost::beast::flat_buffer target_buffer_;
     std::optional<http::request_parser<http::string_body>> parser_;
     
     // Хранилище для запроса и ответа
@@ -53,7 +54,7 @@ public:
           target_socket_(client_socket_.get_executor()),
           resolver_(client_socket_.get_executor()),
           cache_(cache),
-          deadline_(socket.get_executor(),std::chrono::seconds(30)) {
+          deadline_(socket.get_executor(), std::chrono::seconds(30)) {
         
         // Настраиваем SSL-клиента (чтобы прокси доверял серверам в интернете)
         target_ssl_ctx_.set_default_verify_paths();
@@ -85,7 +86,7 @@ public:
 private:
     void read_http_header() {
         auto self = shared_from_this();
-        http::async_read_header(client_socket_, buffer_, *parser_, //у optional перегружен оператор *; same as parser_.value();
+        http::async_read_header(client_socket_, client_buffer_, *parser_, //у optional перегружен оператор *; same as parser_.value();
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) self->on_header_read();
                 else self->close();
@@ -147,7 +148,7 @@ private:
         deadline_.expires_after(std::chrono::seconds(30));      //таймер сессии
         start_timer();
 
-        http::async_read(*client_ssl_stream_, buffer_, *parser_,
+        http::async_read(*client_ssl_stream_, client_buffer_, *parser_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
                     self->current_req_ = self->parser_->release();
@@ -174,7 +175,11 @@ private:
            std::cout << "[CACHE MISS] Fetching from " << target_domain_ << "...\n";
         }
 
-        resolve_target();
+        if (target_socket_.is_open()) {
+            forward_request_to_target();
+        } else {
+            resolve_target();
+        }
     }
 
     // Отправка данных из кэша (мгновенно)
@@ -245,9 +250,10 @@ private:
     void read_response_from_target() {
         auto self = shared_from_this();
         // Очищаем буфер перед чтением ответа
-        buffer_.consume(buffer_.size()); 
         
-        http::async_read(*target_ssl_stream_, buffer_, current_res_,
+        current_res_.clear();
+
+        http::async_read(*target_ssl_stream_, target_buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
                     if (self->current_req_.method() == http::verb::get && self->cache_ != nullptr) {
