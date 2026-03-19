@@ -1,35 +1,33 @@
 #pragma once
 
-#include <string>
-#include <filesystem>
-#include <iostream>
-#include <stdexcept>
-#include <memory>
-
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/pem.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
-#include <boost/asio/ssl.hpp> // Подключаем SSL из Boost
+#include <boost/asio/ssl.hpp>  // Подключаем SSL из Boost
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 class CertManager {
     static inline std::mutex cert_mutex_;
     // КЭШ L1: Хранит готовые к работе SSL-контексты прямо в ОЗУ
     static inline std::unordered_map<std::string, std::shared_ptr<boost::asio::ssl::context>> ctx_cache_;
 
-public:
+   public:
     // Теперь функция возвращает ГОТОВЫЙ КОНТЕКСТ, а не пути к файлам
     static std::shared_ptr<boost::asio::ssl::context> get_context_for_domain(const std::string& domain) {
-        
         // --- 1. БЫСТРАЯ ПРОВЕРКА В ОЗУ (Double-Checked Locking, шаг 1) ---
         {
             std::lock_guard<std::mutex> lock(cert_mutex_);
             auto it = ctx_cache_.find(domain);
             if (it != ctx_cache_.end()) {
-                return it->second; // МГНОВЕННЫЙ ВОЗВРАТ! Никакого диска.
+                return it->second;  // МГНОВЕННЫЙ ВОЗВРАТ! Никакого диска.
             }
         }
 
@@ -60,10 +58,9 @@ public:
 
         // --- 4. СОБИРАЕМ КОНТЕКСТ И СОХРАНЯЕМ В ОЗУ ---
         auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
-        ctx->set_options(boost::asio::ssl::context::default_workarounds |
-                         boost::asio::ssl::context::no_sslv2 |
+        ctx->set_options(boost::asio::ssl::context::default_workarounds | boost::asio::ssl::context::no_sslv2 |
                          boost::asio::ssl::context::no_sslv3);
-        
+
         try {
             ctx->use_certificate_chain_file(out_crt);
             ctx->use_private_key_file(out_key, boost::asio::ssl::context::pem);
@@ -74,14 +71,13 @@ public:
 
         // Кладём в оперативную память для будущих запросов
         ctx_cache_[domain] = ctx;
-        
+
         return ctx;
     }
 
-private:
-    static bool generate_x509(const std::string& domain, const std::string& cert_path, const std::string& key_path, 
+   private:
+    static bool generate_x509(const std::string& domain, const std::string& cert_path, const std::string& key_path,
                               const std::string& ca_cert_path, const std::string& ca_key_path) {
-        
         // --- 1. Читаем Корневой Сертификат (CA) и Ключ ---
         FILE* ca_crt_file = fopen(ca_cert_path.c_str(), "r");
         FILE* ca_key_file = fopen(ca_key_path.c_str(), "r");
@@ -90,20 +86,19 @@ private:
             return false;
         }
 
-        X509* ca_cert = PEM_read_X509(ca_crt_file, nullptr, nullptr, nullptr);
+        X509* ca_cert     = PEM_read_X509(ca_crt_file, nullptr, nullptr, nullptr);
         EVP_PKEY* ca_pkey = PEM_read_PrivateKey(ca_key_file, nullptr, nullptr, nullptr);
         fclose(ca_crt_file);
         fclose(ca_key_file);
 
         if (!ca_cert || !ca_pkey) return false;
 
-       // --- 2. Генерируем новый приватный ключ (Современный EVP API) ---
-        EVP_PKEY* pkey = nullptr;
+        // --- 2. Генерируем новый приватный ключ (Современный EVP API) ---
+        EVP_PKEY* pkey     = nullptr;
         EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
-        
+
         if (pctx) {
-            if (EVP_PKEY_keygen_init(pctx) > 0 && 
-                EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) > 0) {
+            if (EVP_PKEY_keygen_init(pctx) > 0 && EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) > 0) {
                 EVP_PKEY_keygen(pctx, &pkey);
             }
             EVP_PKEY_CTX_free(pctx);
@@ -118,11 +113,13 @@ private:
         // --- 3. Создаем новый сертификат ---
         X509* x509 = X509_new();
         // ВАЖНО: Указываем версию X.509 v3 (цифра 2), чтобы Chrome не ругался на формат!
-        X509_set_version(x509, 2); 
-        
-        ASN1_INTEGER_set(X509_get_serialNumber(x509), 1); // Серийный номер
-        X509_gmtime_adj(X509_get_notBefore(x509), -10000);     // Действителен с прошлого(нужно для того, чтобы если рассинхрон по времени, браузер не ругался)
-        X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // Действителен 1 год
+        X509_set_version(x509, 2);
+
+        ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);  // Серийный номер
+        X509_gmtime_adj(
+            X509_get_notBefore(x509),
+            -10000);  // Действителен с прошлого(нужно для того, чтобы если рассинхрон по времени, браузер не ругался)
+        X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);  // Действителен 1 год
         X509_set_pubkey(x509, pkey);
 
         // --- 4. Задаем Имя субъекта (Common Name) ---
@@ -149,7 +146,7 @@ private:
         // --- 7. Сохраняем сгенерированные сертификат и ключ на диск ---
         FILE* out_crt_file = fopen(cert_path.c_str(), "wb");
         FILE* out_key_file = fopen(key_path.c_str(), "wb");
-        
+
         bool success = false;
         if (out_crt_file && out_key_file) {
             PEM_write_X509(out_crt_file, x509);
