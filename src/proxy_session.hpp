@@ -201,11 +201,11 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
                                   self->close();
                                   return;
                               }
-                              if (self->current_req_.keep_alive()) {
-                                  self->read_decrypted_request();
-                              } else {
-                                  self->close();
-                              }
+                            //   if (self->current_req_.keep_alive()) {
+                            //       self->read_decrypted_request();
+                            //   } else {
+                            //       self->close();
+                            //   }
                           });
     }
 
@@ -239,6 +239,7 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
             if (!ec)
                 self->forward_request_to_target();
             else
+                std::cerr << "[ERROR] Target Handshake Failed for " << self->target_domain_ << ": " << ec.message() << "\n";
                 self->close();
         });
     }
@@ -276,6 +277,7 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
                                  }
                                  self->forward_response_to_client();
                              } else
+                                 std::cerr << "[ERROR] Read from Target Failed for " << self->target_domain_ << ": " << ec.message() << "\n";
                                  self->close();
                          });
     }
@@ -292,13 +294,13 @@ class ProxySession : public std::enable_shared_from_this<ProxySession> {
                 return;
             }
 
-            if (res_ptr->keep_alive()) {
-                self->read_decrypted_request();
-            } else {
-                // Закрываем только если браузер или сервер прямо попросили об этом
-                // (например, прислали заголовок Connection: close)
-                self->close();
-            }
+            // if (res_ptr->keep_alive()) {
+            //     self->read_decrypted_request();
+            // } else {
+            //     // Закрываем только если браузер или сервер прямо попросили об этом
+            //     // (например, прислали заголовок Connection: close)
+            //     self->close();
+            // }
         });
     }
 
