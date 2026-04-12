@@ -13,9 +13,11 @@ set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${CMAKE_EXE_LINKER_FLAGS_DEBUG} -fsanitize=thr
 add_executable(server 
     src/main.cpp 
     src/proxy_server.hpp
-    src/proxy_session.hpp 
+    src/mitm_session.hpp
     src/cert_manager.hpp
     src/lru_cache.hpp
+    src/connection_handler.hpp
+    src/tunnel_session.hpp
 )
 
 target_compile_features(server PUBLIC cxx_std_17)

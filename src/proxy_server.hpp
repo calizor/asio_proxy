@@ -4,7 +4,8 @@
 #include <memory>
 
 #include "lru_cache.hpp"
-#include "proxy_session.hpp"
+// #include "proxy_session.hpp"
+#include "connection_handler.hpp"
 
 namespace asio = boost::asio;
 using tcp      = asio::ip::tcp;
@@ -23,7 +24,8 @@ class ProxyServer : public std::enable_shared_from_this<ProxyServer> {
                                [self = shared_from_this()](boost::system::error_code ec, tcp::socket socket) {
                                    if (!ec) {
                                        // Создаем новую сессию и запускаем её
-                                       std::make_shared<ProxySession>(std::move(socket), self->cache_)->start();
+                                    //    std::make_shared<ProxySession>(std::move(socket), self->cache_)->start();
+                                       std::make_shared<ConnectionHandler>(std::move(socket), self->cache_)->start();
                                    }
                                    self->do_accept();
                                });
