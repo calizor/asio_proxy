@@ -127,6 +127,72 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             });
     }
 
+    // ---------- Вспомогательные функции для анализа Cache-Control ----------
+
+    // Проверяет, содержит ли значение заголовка Cache-Control указанную директиву.
+    // Например: contains_directive("no-cache, max-age=0", "no-cache") → true
+    static bool contains_directive(const std::string& header_value, const std::string& directive) {
+        std::string val = header_value;
+        // Нормализуем к нижнему регистру
+        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+        std::size_t pos = 0;
+        while ((pos = val.find(directive, pos)) != std::string::npos) {
+            // Проверяем, что это отдельное слово, а не часть другой директивы
+            bool left_ok  = (pos == 0 || val[pos - 1] == ',' || val[pos - 1] == ' ');
+            bool right_ok = (pos + directive.size() == val.size() ||
+                             val[pos + directive.size()] == ',' ||
+                             val[pos + directive.size()] == ' ' ||
+                             val[pos + directive.size()] == '=');
+            if (left_ok && right_ok)
+                return true;
+            pos += directive.size();
+        }
+        return false;
+    }
+
+    // Возвращает true, если запрос запрещает использование кэша.
+    // RFC 7234 §5.2.1: Cache-Control: no-cache, no-store; Pragma: no-cache
+    bool request_bypasses_cache() const {
+        // Cache-Control: no-store — клиент категорически против кэша
+        // Cache-Control: no-cache — клиент хочет ревалидацию (мы трактуем как bypass)
+        auto cc = std::string(current_req_[http::field::cache_control]);
+        if (!cc.empty()) {
+            if (contains_directive(cc, "no-store") || contains_directive(cc, "no-cache"))
+                return true;
+        }
+
+        // Pragma: no-cache — устаревший HTTP/1.0 эквивалент Cache-Control: no-cache
+        auto pragma = std::string(current_req_[http::field::pragma]);
+        if (!pragma.empty() && contains_directive(pragma, "no-cache"))
+            return true;
+
+        return false;
+    }
+
+    // Возвращает true, если ответ сервера запрещает его кэширование.
+    // RFC 7234 §5.2.2: Cache-Control: no-store, private, no-cache
+    bool response_is_cacheable() const {
+        auto cc = std::string(current_res_[http::field::cache_control]);
+        if (!cc.empty()) {
+            // no-store — нельзя сохранять вообще
+            if (contains_directive(cc, "no-store"))
+                return false;
+            // private — только для конечного пользователя, не для промежуточных кэшей
+            if (contains_directive(cc, "private"))
+                return false;
+            // no-cache — требует ревалидации при каждом запросе, не храним
+            if (contains_directive(cc, "no-cache"))
+                return false;
+        }
+
+        // Pragma: no-cache в ответе (редко, но бывает)
+        auto pragma = std::string(current_res_[http::field::pragma]);
+        if (!pragma.empty() && contains_directive(pragma, "no-cache"))
+            return false;
+
+        return true;
+    }
+
     // ---------- ШАГ 3: Кэш и маршрутизация ----------
 
     void process_request() {
@@ -134,13 +200,16 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
 
         std::cout << "[MITM] " << current_req_.method_string() << " " << cache_key_ << "\n";
 
-        if (current_req_.method() == http::verb::get && cache_) {
+        // Проверяем кэш только для GET и только если запрос не запрещает кэширование
+        if (current_req_.method() == http::verb::get && cache_ && !request_bypasses_cache()) {
             if (auto hit = cache_->get(cache_key_)) {
                 std::cout << "[CACHE HIT] " << cache_key_ << "\n";
                 send_cached_response(*hit);
                 return;
             }
             std::cout << "[CACHE MISS] " << target_domain_ << "\n";
+        } else if (request_bypasses_cache()) {
+            std::cout << "[CACHE BYPASS] " << cache_key_ << "\n";
         }
 
         if (target_socket_.is_open()) {
@@ -228,10 +297,17 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             *target_ssl_stream_, target_buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    if (self->current_req_.method() == http::verb::get && self->cache_) {
+                    // Кэшируем только GET-ответы, если и запрос, и ответ разрешают кэширование
+                    if (self->current_req_.method() == http::verb::get &&
+                        self->cache_ &&
+                        !self->request_bypasses_cache() &&
+                        self->response_is_cacheable()) {
                         std::ostringstream oss;
                         oss << self->current_res_;
                         self->cache_->put(self->cache_key_, oss.str());
+                        std::cout << "[CACHE PUT] " << self->cache_key_ << "\n";
+                    } else {
+                        std::cout << "[CACHE SKIP] " << self->cache_key_ << "\n";
                     }
                     self->forward_to_client();
                 } else {
