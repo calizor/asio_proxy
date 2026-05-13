@@ -7,8 +7,11 @@
 #include <vector>
 
 #include "lru_cache.hpp"
-#include "proxy_server.hpp"  // Подключаем только сервер!
-#define PORT 8080
+#include "proxy_server.hpp"
+#include "log_server.hpp"
+
+#define PROXY_PORT 8080
+#define LOG_PORT   8081
 
 namespace asio = boost::asio;
 
@@ -21,39 +24,36 @@ int main(int argc, char* argv[]) {
     auto const threads = std::max<int>(1, std::atoi(argv[1]));
     asio::io_context ioc{threads};
 
-    auto global_cache = std::make_shared<LRUCache>(1000);
+    // ── Запускаем WebSocket-сервер для веб-панели ──
+    LogServer::init(ioc, LOG_PORT);
+    std::cout << "[SERVER] Веб-панель: открой panel.html в браузере\n";
 
-    // Запускаем сервер на порту 8080
-    std::make_shared<ProxyServer>(ioc, PORT, global_cache)->do_accept();
+    // ── Запускаем прокси ──
+    auto global_cache = std::make_shared<LRUCache>(1000);
+    std::make_shared<ProxyServer>(ioc, PROXY_PORT, global_cache)->do_accept();
+    std::cout << "[SERVER] Прокси слушает на порту " << PROXY_PORT << "\n";
 
     asio::signal_set signals(ioc, SIGINT, SIGTERM);
-
-    // Асинхронно ждем нажатия Ctrl+C
-    signals.async_wait([&ioc](boost::system::error_code const& ec, int signal_number) {
+    signals.async_wait([&ioc](boost::system::error_code const& ec, int) {
         if (!ec) {
-            std::cout << "\n[SERVER] Получен сигнал (Ctrl+C). Остановка серверов...\n";
-            // Вот теперь мы легально останавливаем бесконечный цикл!
+            std::cout << "\n[SERVER] Остановка...\n";
             ioc.stop();
         }
     });
 
-    // Создаем пул потоков
     std::vector<std::thread> v;
     v.reserve(threads - 1);
-    for (auto i = threads - 1; i > 0; --i) {
+    for (auto i = threads - 1; i > 0; --i)
         v.emplace_back([&ioc, i] {
-            std::cout << "Thread " << i << " is running\n";
+            std::cout << "Thread " << i << " started\n";
             ioc.run();
         });
-    }
 
-    std::cout << "Main thread is running\n";
+    std::cout << "Main thread running\n";
     ioc.run();
 
-    // Корректное завершение потоков, только до сюда не доходит, ioc.run() бесконечный до ioc.stop()(наверное);
-    for (auto& t : v) {
+    for (auto& t : v)
         if (t.joinable()) t.join();
-    }
 
     return EXIT_SUCCESS;
 }

@@ -5,6 +5,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <string>
 
 #include "cert_manager.hpp"
+#include "log_server.hpp"
 #include "lru_cache.hpp"
 
 namespace asio = boost::asio;
@@ -19,23 +21,13 @@ namespace ssl  = boost::asio::ssl;
 namespace http = boost::beast::http;
 using tcp      = asio::ip::tcp;
 
-// MitmSession — HTTPS MITM-прокси.
-// Получает уже распарсенный домен из ConnectionHandler.
-// Выполняет TLS-handshake с браузером (поддельный сертификат),
-// затем устанавливает TLS с целевым сервером и проксирует трафик.
-//
-// Контракт: ConnectionHandler уже отправил "200 Connection Established"
-// браузеру перед передачей сокета в этот класс.
-
 class MitmSession : public std::enable_shared_from_this<MitmSession> {
     tcp::socket   client_socket_;
     tcp::socket   target_socket_;
     tcp::resolver resolver_;
 
-    // TLS с браузером (мы — сервер)
     std::optional<ssl::stream<tcp::socket&>> client_ssl_stream_;
 
-    // TLS с целевым сервером (мы — клиент)
     ssl::context target_ssl_ctx_{ssl::context::tls_client};
     std::optional<ssl::stream<tcp::socket&>> target_ssl_stream_;
 
@@ -52,6 +44,9 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
 
     boost::asio::steady_timer deadline_;
 
+    // Для измерения латентности
+    std::chrono::steady_clock::time_point req_start_;
+
    public:
     MitmSession(tcp::socket socket, std::string domain, std::shared_ptr<LRUCache> cache = nullptr)
         : client_socket_(std::move(socket)),
@@ -63,36 +58,30 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
         target_ssl_ctx_.set_default_verify_paths();
     }
 
-    // Точка входа — браузер уже получил 200 от ConnectionHandler
     void start() {
         reset_deadline();
         do_client_handshake();
     }
 
    private:
-    // ---------- Таймер ----------
-
     void reset_deadline(std::chrono::seconds timeout = std::chrono::seconds(30)) {
         deadline_.expires_after(timeout);
         auto self = shared_from_this();
         deadline_.async_wait([self](boost::system::error_code ec) {
-            if (ec == boost::asio::error::operation_aborted)
-                return;
+            if (ec == boost::asio::error::operation_aborted) return;
             if (!ec) {
-                std::cout << "[TIMEOUT] " << self->target_domain_ << "\n";
+                LogServer::instance().log_timeout(self->target_domain_);
                 self->close();
             }
         });
     }
-
-    // ---------- ШАГ 1: TLS-handshake с браузером ----------
 
     void do_client_handshake() {
         auto self        = shared_from_this();
         auto session_ctx = CertManager::get_context_for_domain(target_domain_);
 
         if (!session_ctx) {
-            std::cerr << "[MITM] No SSL context for " << target_domain_ << "\n";
+            LogServer::instance().log_error(target_domain_, "No SSL context");
             close();
             return;
         }
@@ -103,12 +92,12 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             [self](boost::system::error_code ec) {
                 if (!ec)
                     self->read_client_request();
-                else
+                else {
+                    LogServer::instance().log_error(self->target_domain_, "Client TLS handshake: " + ec.message());
                     self->close();
+                }
             });
     }
-
-    // ---------- ШАГ 2: Читаем запрос от браузера ----------
 
     void read_client_request() {
         auto self = shared_from_this();
@@ -127,89 +116,22 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             });
     }
 
-    // ---------- Вспомогательные функции для анализа Cache-Control ----------
-
-    // Проверяет, содержит ли значение заголовка Cache-Control указанную директиву.
-    // Например: contains_directive("no-cache, max-age=0", "no-cache") → true
-    static bool contains_directive(const std::string& header_value, const std::string& directive) {
-        std::string val = header_value;
-        // Нормализуем к нижнему регистру
-        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-        std::size_t pos = 0;
-        while ((pos = val.find(directive, pos)) != std::string::npos) {
-            // Проверяем, что это отдельное слово, а не часть другой директивы
-            bool left_ok  = (pos == 0 || val[pos - 1] == ',' || val[pos - 1] == ' ');
-            bool right_ok = (pos + directive.size() == val.size() ||
-                             val[pos + directive.size()] == ',' ||
-                             val[pos + directive.size()] == ' ' ||
-                             val[pos + directive.size()] == '=');
-            if (left_ok && right_ok)
-                return true;
-            pos += directive.size();
-        }
-        return false;
-    }
-
-    // Возвращает true, если запрос запрещает использование кэша.
-    // RFC 7234 §5.2.1: Cache-Control: no-cache, no-store; Pragma: no-cache
-    bool request_bypasses_cache() const {
-        // Cache-Control: no-store — клиент категорически против кэша
-        // Cache-Control: no-cache — клиент хочет ревалидацию (мы трактуем как bypass)
-        auto cc = std::string(current_req_[http::field::cache_control]);
-        if (!cc.empty()) {
-            if (contains_directive(cc, "no-store") || contains_directive(cc, "no-cache"))
-                return true;
-        }
-
-        // Pragma: no-cache — устаревший HTTP/1.0 эквивалент Cache-Control: no-cache
-        auto pragma = std::string(current_req_[http::field::pragma]);
-        if (!pragma.empty() && contains_directive(pragma, "no-cache"))
-            return true;
-
-        return false;
-    }
-
-    // Возвращает true, если ответ сервера запрещает его кэширование.
-    // RFC 7234 §5.2.2: Cache-Control: no-store, private, no-cache
-    bool response_is_cacheable() const {
-        auto cc = std::string(current_res_[http::field::cache_control]);
-        if (!cc.empty()) {
-            // no-store — нельзя сохранять вообще
-            if (contains_directive(cc, "no-store"))
-                return false;
-            // private — только для конечного пользователя, не для промежуточных кэшей
-            if (contains_directive(cc, "private"))
-                return false;
-            // no-cache — требует ревалидации при каждом запросе, не храним
-            if (contains_directive(cc, "no-cache"))
-                return false;
-        }
-
-        // Pragma: no-cache в ответе (редко, но бывает)
-        auto pragma = std::string(current_res_[http::field::pragma]);
-        if (!pragma.empty() && contains_directive(pragma, "no-cache"))
-            return false;
-
-        return true;
-    }
-
-    // ---------- ШАГ 3: Кэш и маршрутизация ----------
-
     void process_request() {
         cache_key_ = target_domain_ + std::string(current_req_.target());
+        req_start_ = std::chrono::steady_clock::now();
 
-        std::cout << "[MITM] " << current_req_.method_string() << " " << cache_key_ << "\n";
+        const std::string method = std::string(current_req_.method_string());
+        const std::string path   = std::string(current_req_.target());
 
-        // Проверяем кэш только для GET и только если запрос не запрещает кэширование
-        if (current_req_.method() == http::verb::get && cache_ && !request_bypasses_cache()) {
+        LogServer::instance().log_mitm(method, target_domain_, path);
+
+        if (current_req_.method() == http::verb::get && cache_) {
             if (auto hit = cache_->get(cache_key_)) {
-                std::cout << "[CACHE HIT] " << cache_key_ << "\n";
+                LogServer::instance().log_cache_hit(target_domain_, path);
                 send_cached_response(*hit);
                 return;
             }
-            std::cout << "[CACHE MISS] " << target_domain_ << "\n";
-        } else if (request_bypasses_cache()) {
-            std::cout << "[CACHE BYPASS] " << cache_key_ << "\n";
+            LogServer::instance().log_cache_miss(target_domain_);
         }
 
         if (target_socket_.is_open()) {
@@ -227,13 +149,11 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             *client_ssl_stream_, asio::buffer(*raw_ptr),
             [self, raw_ptr](boost::system::error_code ec, std::size_t) {
                 if (!ec)
-                    self->read_client_request();  // keep-alive loop
+                    self->read_client_request();
                 else
                     self->close();
             });
     }
-
-    // ---------- ШАГ 4: Подключаемся к целевому серверу ----------
 
     void resolve_target() {
         auto self = shared_from_this();
@@ -246,10 +166,13 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
                         [self](boost::system::error_code ec, const tcp::endpoint&) {
                             if (!ec)
                                 self->do_target_handshake();
-                            else
+                            else {
+                                LogServer::instance().log_error(self->target_domain_, "Connect failed: " + ec.message());
                                 self->close();
+                            }
                         });
                 } else {
+                    LogServer::instance().log_error(self->target_domain_, "DNS failed: " + ec.message());
                     self->close();
                 }
             });
@@ -266,14 +189,11 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
                 if (!ec) {
                     self->forward_to_target();
                 } else {
-                    std::cerr << "[MITM] Target handshake failed for "
-                              << self->target_domain_ << ": " << ec.message() << "\n";
+                    LogServer::instance().log_error(self->target_domain_, "Target TLS: " + ec.message());
                     self->close();
                 }
             });
     }
-
-    // ---------- ШАГ 5: Запрос → целевой сервер ----------
 
     void forward_to_target() {
         auto self = shared_from_this();
@@ -284,8 +204,10 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec)
                     self->read_target_response();
-                else
+                else {
+                    LogServer::instance().log_error(self->target_domain_, "Forward write: " + ec.message());
                     self->close();
+                }
             });
     }
 
@@ -297,28 +219,29 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             *target_ssl_stream_, target_buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    // Кэшируем только GET-ответы, если и запрос, и ответ разрешают кэширование
-                    if (self->current_req_.method() == http::verb::get &&
-                        self->cache_ &&
-                        !self->request_bypasses_cache() &&
-                        self->response_is_cacheable()) {
+                    // Вычисляем латентность
+                    auto elapsed = std::chrono::steady_clock::now() - self->req_start_;
+                    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
+                    int    status = static_cast<int>(self->current_res_.result_int());
+                    size_t bytes  = self->current_res_.body().size();
+                    std::string path = std::string(self->current_req_.target());
+
+                    // Кэшируем GET
+                    if (self->current_req_.method() == http::verb::get && self->cache_) {
                         std::ostringstream oss;
                         oss << self->current_res_;
                         self->cache_->put(self->cache_key_, oss.str());
-                        std::cout << "[CACHE PUT] " << self->cache_key_ << "\n";
-                    } else {
-                        std::cout << "[CACHE SKIP] " << self->cache_key_ << "\n";
                     }
+
+                    LogServer::instance().log_response(self->target_domain_, path, status, bytes, ms);
                     self->forward_to_client();
                 } else {
-                    std::cerr << "[MITM] Read from target failed for "
-                              << self->target_domain_ << ": " << ec.message() << "\n";
+                    LogServer::instance().log_error(self->target_domain_, "Read response: " + ec.message());
                     self->close();
                 }
             });
     }
-
-    // ---------- ШАГ 6: Ответ → браузер ----------
 
     void forward_to_client() {
         auto self    = shared_from_this();
@@ -327,19 +250,13 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
         http::async_write(
             *client_ssl_stream_, *res_ptr,
             [self, res_ptr](boost::system::error_code ec, std::size_t) {
-                if (ec) {
-                    self->close();
-                    return;
-                }
-                if (res_ptr->keep_alive()) {
+                if (ec) { self->close(); return; }
+                if (res_ptr->keep_alive())
                     self->read_client_request();
-                } else {
+                else
                     self->close();
-                }
             });
     }
-
-    // ---------- Закрытие ----------
 
     void close() {
         boost::system::error_code ec;

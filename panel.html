@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProxyShark — Live Traffic Analyzer</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Rajdhani:wght@500;600;700&display=swap');
+
+  :root {
+    --bg0: #0d0f12;
+    --bg1: #121519;
+    --bg2: #181c22;
+    --bg3: #1e2330;
+    --border: #2a3040;
+    --border2: #333d52;
+    --accent: #00d4ff;
+    --accent2: #0099cc;
+    --green: #39d353;
+    --yellow: #e3b341;
+    --red: #f85149;
+    --orange: #ff7b54;
+    --purple: #a78bfa;
+    --muted: #4a5568;
+    --text: #c9d1d9;
+    --text2: #8b949e;
+    --text3: #4a5568;
+
+    /* Row type colors */
+    --c-connect:    #1a2a3a;
+    --c-mitm:       #1a2a1a;
+    --c-cache-hit:  #1a2a1a;
+    --c-cache-miss: #2a1a0a;
+    --c-response:   #0d0f12;
+    --c-timeout:    #2a1a1a;
+    --c-error:      #2a0f0f;
+    --c-tunnel:     #1a1a2a;
+
+    --t-connect:    #5eaeff;
+    --t-mitm:       #39d353;
+    --t-cache-hit:  #00d4ff;
+    --t-cache-miss: #e3b341;
+    --t-response:   #8b949e;
+    --t-timeout:    #ff7b54;
+    --t-error:      #f85149;
+    --t-tunnel:     #a78bfa;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg0);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── TOP BAR ── */
+  .topbar {
+    background: var(--bg1);
+    border-bottom: 1px solid var(--border);
+    padding: 0 12px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .logo {
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .logo-shark { font-size: 20px; }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    transition: background 0.3s;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px currentColor;
+  }
+  .status-dot.live { background: var(--green); animation: pulse 1.5s infinite; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--green); }
+    50%       { opacity: 0.5; box-shadow: 0 0 2px var(--green); }
+  }
+
+  .status-text {
+    font-size: 11px;
+    color: var(--text2);
+  }
+
+  .sep { width: 1px; height: 24px; background: var(--border); flex-shrink: 0; }
+
+  .toolbar-group { display: flex; align-items: center; gap: 4px; }
+
+  .btn {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--text2);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .btn:hover { border-color: var(--border2); color: var(--text); background: var(--bg3); }
+  .btn.active { border-color: var(--accent2); color: var(--accent); background: #0d1e2a; }
+  .btn.danger:hover { border-color: var(--red); color: var(--red); }
+
+  .filter-input {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 3px;
+    width: 220px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .filter-input:focus { border-color: var(--accent2); }
+  .filter-input::placeholder { color: var(--text3); }
+
+  .stats-row {
+    margin-left: auto;
+    display: flex;
+    gap: 16px;
+    font-size: 10px;
+    color: var(--text2);
+  }
+  .stat-item { display: flex; gap: 4px; align-items: center; }
+  .stat-val { color: var(--text); font-weight: 500; }
+
+  /* ── FILTER CHIPS ── */
+  .filter-bar {
+    background: var(--bg1);
+    border-bottom: 1px solid var(--border);
+    padding: 5px 12px;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .chip {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 2px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .chip-all   { background: #1a1e28; border-color: var(--border2); color: var(--text2); }
+  .chip-all.active { background: var(--bg3); border-color: var(--accent2); color: var(--accent); }
+  .chip[data-type="CONNECT"]   { background: #0e1820; color: var(--t-connect);    border-color: #1a3050; }
+  .chip[data-type="MITM"]      { background: #0a1a0a; color: var(--t-mitm);       border-color: #1a3a1a; }
+  .chip[data-type="CACHE_HIT"] { background: #051520; color: var(--t-cache-hit);  border-color: #0a2a3a; }
+  .chip[data-type="CACHE_MISS"]{ background: #1a1000; color: var(--t-cache-miss); border-color: #3a2800; }
+  .chip[data-type="RESPONSE"]  { background: #141820; color: var(--t-response);   border-color: #2a3040; }
+  .chip[data-type="TIMEOUT"]   { background: #1a1000; color: var(--t-timeout);    border-color: #3a2000; }
+  .chip[data-type="ERROR"]     { background: #1a0808; color: var(--t-error);      border-color: #3a1010; }
+  .chip[data-type="TUNNEL"]    { background: #0e0e1a; color: var(--t-tunnel);     border-color: #2a1a3a; }
+  .chip.active { opacity: 1; filter: brightness(1.3); }
+  .chip:not(.active) { opacity: 0.45; }
+
+  .chip-label { margin-right: 4px; }
+  .chip-count { opacity: 0.7; }
+
+  /* ── MAIN LAYOUT ── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    flex-direction: column;
+  }
+
+  /* ── TABLE ── */
+  .table-wrap {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+  }
+
+  .table-wrap::-webkit-scrollbar { width: 6px; height: 6px; }
+  .table-wrap::-webkit-scrollbar-track { background: var(--bg0); }
+  .table-wrap::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+
+  thead {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+
+  th {
+    background: var(--bg2);
+    border-bottom: 2px solid var(--border2);
+    border-right: 1px solid var(--border);
+    color: var(--text2);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 6px 8px;
+    text-align: left;
+    user-select: none;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  th:hover { color: var(--text); background: var(--bg3); }
+  th:last-child { border-right: none; }
+
+  /* Column widths */
+  .col-id        { width: 55px; }
+  .col-time      { width: 90px; }
+  .col-type      { width: 100px; }
+  .col-method    { width: 70px; }
+  .col-domain    { width: 220px; }
+  .col-path      { width: auto; }
+  .col-status    { width: 60px; }
+  .col-bytes     { width: 80px; }
+  .col-latency   { width: 80px; }
+  .col-info      { width: 140px; }
+
+  tbody tr {
+    border-bottom: 1px solid rgba(42, 48, 64, 0.5);
+    cursor: pointer;
+    transition: filter 0.08s;
+  }
+
+  tbody tr:hover { filter: brightness(1.4); }
+  tbody tr.selected { outline: 1px solid var(--accent2); outline-offset: -1px; }
+
+  tbody tr[data-type="CONNECT"]    { background: var(--c-connect); }
+  tbody tr[data-type="MITM"]       { background: var(--c-mitm); }
+  tbody tr[data-type="CACHE_HIT"]  { background: var(--c-cache-hit); }
+  tbody tr[data-type="CACHE_MISS"] { background: var(--c-cache-miss); }
+  tbody tr[data-type="RESPONSE"]   { background: var(--c-response); }
+  tbody tr[data-type="TIMEOUT"]    { background: var(--c-timeout); }
+  tbody tr[data-type="ERROR"]      { background: var(--c-error); }
+  tbody tr[data-type="TUNNEL"]     { background: var(--c-tunnel); }
+
+  td {
+    padding: 4px 8px;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-right: 1px solid rgba(42, 48, 64, 0.3);
+    vertical-align: middle;
+  }
+  td:last-child { border-right: none; }
+
+  .td-id     { color: var(--text3); font-size: 10px; }
+  .td-time   { color: var(--text2); }
+
+  .badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 2px;
+    letter-spacing: 0.3px;
+  }
+  .badge-CONNECT    { background: #0e2040; color: var(--t-connect);    border: 1px solid #1a4080; }
+  .badge-MITM       { background: #0a200a; color: var(--t-mitm);       border: 1px solid #1a4a1a; }
+  .badge-CACHE_HIT  { background: #051520; color: var(--t-cache-hit);  border: 1px solid #0a3050; }
+  .badge-CACHE_MISS { background: #1a1000; color: var(--t-cache-miss); border: 1px solid #3a2800; }
+  .badge-RESPONSE   { background: #141820; color: var(--t-response);   border: 1px solid #2a3050; }
+  .badge-TIMEOUT    { background: #1a1200; color: var(--t-timeout);    border: 1px solid #3a2800; }
+  .badge-ERROR      { background: #1a0505; color: var(--t-error);      border: 1px solid #3a1010; }
+  .badge-TUNNEL     { background: #0e0e1a; color: var(--t-tunnel);     border: 1px solid #2a1a4a; }
+
+  .td-method { color: var(--yellow); font-size: 10px; font-weight: 600; }
+  .td-domain { color: var(--text); }
+  .td-path   { color: var(--text2); font-size: 10px; }
+
+  .status-code {
+    font-weight: 600;
+    font-size: 11px;
+  }
+  .s2xx { color: var(--green); }
+  .s3xx { color: var(--accent); }
+  .s4xx { color: var(--yellow); }
+  .s5xx { color: var(--red); }
+  .s0   { color: var(--text3); }
+
+  .td-bytes   { color: var(--text2); text-align: right; font-size: 10px; }
+  .td-latency { text-align: right; font-size: 10px; }
+  .lat-fast   { color: var(--green); }
+  .lat-mid    { color: var(--yellow); }
+  .lat-slow   { color: var(--red); }
+
+  .td-info { color: var(--text3); font-size: 10px; font-style: italic; }
+
+  /* ── DETAIL PANE ── */
+  .detail-pane {
+    height: 0;
+    overflow: hidden;
+    border-top: 1px solid var(--border2);
+    background: var(--bg1);
+    transition: height 0.2s ease;
+    flex-shrink: 0;
+  }
+  .detail-pane.open { height: 200px; }
+
+  .detail-inner {
+    display: flex;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .detail-section {
+    flex: 1;
+    padding: 10px 12px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+  }
+  .detail-section:last-child { border-right: none; }
+  .detail-section::-webkit-scrollbar { width: 4px; }
+  .detail-section::-webkit-scrollbar-thumb { background: var(--border2); }
+
+  .detail-title {
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+  }
+
+  .detail-row {
+    display: flex;
+    gap: 8px;
+    padding: 2px 0;
+    font-size: 11px;
+  }
+  .detail-key   { color: var(--text2); min-width: 90px; flex-shrink: 0; }
+  .detail-value { color: var(--text); word-break: break-all; }
+
+  /* ── STATUS BAR ── */
+  .statusbar {
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    padding: 3px 12px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    font-size: 10px;
+    color: var(--text2);
+    flex-shrink: 0;
+  }
+
+  .statusbar-right { margin-left: auto; }
+
+  /* ── EMPTY STATE ── */
+  .empty-state {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    color: var(--text3);
+    gap: 8px;
+  }
+  .empty-icon { font-size: 32px; }
+  .empty-text { font-size: 12px; }
+
+  /* ── DEMO MODE BANNER ── */
+  .demo-banner {
+    background: linear-gradient(90deg, #1a1000, #2a1500, #1a1000);
+    border-bottom: 1px solid #3a2800;
+    padding: 3px 12px;
+    text-align: center;
+    font-size: 10px;
+    color: var(--yellow);
+    flex-shrink: 0;
+    display: none;
+  }
+
+  /* row insert animation */
+  @keyframes rowIn {
+    from { opacity: 0; background-color: rgba(0, 212, 255, 0.08); }
+    to   { opacity: 1; }
+  }
+  .row-new { animation: rowIn 0.4s ease; }
+
+  /* Resize handle */
+  .resize-handle {
+    height: 4px;
+    background: var(--border);
+    cursor: ns-resize;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .resize-handle:hover { background: var(--accent2); }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="logo"><span class="logo-shark">🦈</span> ProxyShark</div>
+  <div class="sep"></div>
+  <div class="status-dot" id="dot"></div>
+  <span class="status-text" id="status-text">Disconnected</span>
+  <div class="sep"></div>
+  <div class="toolbar-group">
+    <button class="btn active" id="btn-capture" onclick="toggleCapture()">⏸ Pause</button>
+    <button class="btn danger" onclick="clearAll()">🗑 Clear</button>
+    <button class="btn" onclick="exportJSON()">⬇ Export</button>
+  </div>
+  <div class="sep"></div>
+  <input class="filter-input" id="filter-input" placeholder="filter: domain, method, status…" oninput="applyFilter()">
+  <div class="sep"></div>
+  <label style="font-size:11px;color:var(--text2);display:flex;align-items:center;gap:5px;cursor:pointer;">
+    <input type="checkbox" id="auto-scroll" checked style="accent-color:var(--accent)"> autoscroll
+  </label>
+  <div class="stats-row">
+    <div class="stat-item">Packets: <span class="stat-val" id="st-total">0</span></div>
+    <div class="stat-item">Errors: <span class="stat-val" id="st-errors" style="color:var(--red)">0</span></div>
+    <div class="stat-item">Cache hits: <span class="stat-val" id="st-cache" style="color:var(--accent)">0</span></div>
+  </div>
+</div>
+
+<!-- DEMO BANNER -->
+<div class="demo-banner" id="demo-banner">
+  ⚠ DEMO MODE — подключитесь к прокси-серверу на ws://localhost:8081 или нажмите "Demo" для симуляции данных
+</div>
+
+<!-- FILTER CHIPS -->
+<div class="filter-bar">
+  <span style="font-size:10px;color:var(--text3);margin-right:4px;">TYPE:</span>
+  <div class="chip chip-all active" onclick="toggleType('ALL')"><span class="chip-label">ALL</span><span class="chip-count" id="cnt-ALL">0</span></div>
+  <div class="chip active" data-type="CONNECT"    onclick="toggleType('CONNECT')"   ><span class="chip-label">CONNECT</span><span class="chip-count" id="cnt-CONNECT">0</span></div>
+  <div class="chip active" data-type="MITM"       onclick="toggleType('MITM')"      ><span class="chip-label">MITM</span><span class="chip-count" id="cnt-MITM">0</span></div>
+  <div class="chip active" data-type="CACHE_HIT"  onclick="toggleType('CACHE_HIT')" ><span class="chip-label">CACHE HIT</span><span class="chip-count" id="cnt-CACHE_HIT">0</span></div>
+  <div class="chip active" data-type="CACHE_MISS" onclick="toggleType('CACHE_MISS')"><span class="chip-label">CACHE MISS</span><span class="chip-count" id="cnt-CACHE_MISS">0</span></div>
+  <div class="chip active" data-type="RESPONSE"   onclick="toggleType('RESPONSE')"  ><span class="chip-label">RESPONSE</span><span class="chip-count" id="cnt-RESPONSE">0</span></div>
+  <div class="chip active" data-type="TUNNEL"     onclick="toggleType('TUNNEL')"    ><span class="chip-label">TUNNEL</span><span class="chip-count" id="cnt-TUNNEL">0</span></div>
+  <div class="chip active" data-type="TIMEOUT"    onclick="toggleType('TIMEOUT')"   ><span class="chip-label">TIMEOUT</span><span class="chip-count" id="cnt-TIMEOUT">0</span></div>
+  <div class="chip active" data-type="ERROR"      onclick="toggleType('ERROR')"     ><span class="chip-label">ERROR</span><span class="chip-count" id="cnt-ERROR">0</span></div>
+  <span style="margin-left:auto;font-size:10px;color:var(--text3);" id="ws-url-label">ws://localhost:8081</span>
+  <button class="btn" onclick="startDemo()" style="margin-left:8px;">▶ Demo</button>
+  <button class="btn" onclick="connectWS()" style="margin-left:4px;">⚡ Connect</button>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+  <div class="table-wrap" id="table-wrap">
+    <table id="main-table">
+      <thead>
+        <tr>
+          <th class="col-id">#</th>
+          <th class="col-time">Time</th>
+          <th class="col-type">Type</th>
+          <th class="col-method">Method</th>
+          <th class="col-domain">Domain</th>
+          <th class="col-path">Path</th>
+          <th class="col-status">Status</th>
+          <th class="col-bytes">Bytes</th>
+          <th class="col-latency">Latency</th>
+          <th class="col-info">Info</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">📡</div>
+      <div class="empty-text">Нет данных. Подключитесь к прокси или запустите Demo.</div>
+    </div>
+  </div>
+
+  <div class="resize-handle" id="resize-handle"></div>
+
+  <!-- DETAIL PANE -->
+  <div class="detail-pane" id="detail-pane">
+    <div class="detail-inner">
+      <div class="detail-section">
+        <div class="detail-title">📋 Request Details</div>
+        <div id="detail-req"></div>
+      </div>
+      <div class="detail-section">
+        <div class="detail-title">📊 Response / Meta</div>
+        <div id="detail-res"></div>
+      </div>
+      <div class="detail-section">
+        <div class="detail-title">🔗 Raw JSON</div>
+        <pre id="detail-raw" style="font-size:10px;color:var(--text2);white-space:pre-wrap;word-break:break-all;"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- STATUS BAR -->
+<div class="statusbar">
+  <span id="sb-rows">0 entries</span>
+  <span id="sb-filtered">0 shown</span>
+  <span id="sb-bytes">0 B transferred</span>
+  <span class="statusbar-right" id="sb-time"></span>
+</div>
+
+<script>
+// ──────────────────────────────────────────────
+//  State
+// ──────────────────────────────────────────────
+let allEntries    = [];       // all received entries
+let filteredRows  = [];       // currently visible entries (after filter)
+let selectedId    = null;
+let capturing     = true;
+let ws            = null;
+let demoInterval  = null;
+
+let activeTypes   = new Set(['CONNECT','MITM','CACHE_HIT','CACHE_MISS','RESPONSE','TUNNEL','TIMEOUT','ERROR']);
+let textFilter    = '';
+
+let counts = {};
+['CONNECT','MITM','CACHE_HIT','CACHE_MISS','RESPONSE','TUNNEL','TIMEOUT','ERROR'].forEach(t => counts[t] = 0);
+
+let totalBytes  = 0;
+let errorCount  = 0;
+let cacheHits   = 0;
+
+// ──────────────────────────────────────────────
+//  WebSocket
+// ──────────────────────────────────────────────
+function connectWS() {
+  if (ws) ws.close();
+  const url = 'ws://localhost:8081';
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    setStatus(true);
+    stopDemo();
+    document.getElementById('demo-banner').style.display = 'none';
+  };
+  ws.onmessage = (e) => {
+    try {
+      const entry = JSON.parse(e.data);
+      ingestEntry(entry);
+    } catch {}
+  };
+  ws.onclose = () => {
+    setStatus(false);
+    document.getElementById('demo-banner').style.display = 'block';
+  };
+  ws.onerror = () => {
+    setStatus(false);
+    document.getElementById('demo-banner').style.display = 'block';
+  };
+}
+
+function setStatus(live) {
+  const dot  = document.getElementById('dot');
+  const text = document.getElementById('status-text');
+  dot.className  = 'status-dot' + (live ? ' live' : '');
+  text.textContent = live ? 'Live — ws://localhost:8081' : 'Disconnected';
+  text.style.color = live ? 'var(--green)' : 'var(--red)';
+}
+
+// ──────────────────────────────────────────────
+//  Entry ingestion
+// ──────────────────────────────────────────────
+function ingestEntry(entry) {
+  if (!capturing) return;
+
+  allEntries.push(entry);
+  counts[entry.type] = (counts[entry.type] || 0) + 1;
+  totalBytes  += entry.bytes || 0;
+  if (entry.type === 'ERROR' || entry.type === 'TIMEOUT') errorCount++;
+  if (entry.type === 'CACHE_HIT') cacheHits++;
+
+  updateChipCounts();
+  updateStats();
+
+  // Check if visible
+  if (matchesFilter(entry)) {
+    filteredRows.push(entry);
+    appendRow(entry, true);
+  }
+
+  updateStatusBar();
+}
+
+function matchesFilter(entry) {
+  if (!activeTypes.has(entry.type)) return false;
+  if (!textFilter) return true;
+  const q = textFilter.toLowerCase();
+  return (
+    (entry.domain||'').toLowerCase().includes(q) ||
+    (entry.path||'').toLowerCase().includes(q) ||
+    (entry.method||'').toLowerCase().includes(q) ||
+    (entry.info||'').toLowerCase().includes(q) ||
+    String(entry.status||'').includes(q) ||
+    (entry.type||'').toLowerCase().includes(q)
+  );
+}
+
+// ──────────────────────────────────────────────
+//  DOM row rendering
+// ──────────────────────────────────────────────
+function appendRow(entry, animate) {
+  const tbody = document.getElementById('tbody');
+  document.getElementById('empty-state').style.display = 'none';
+
+  const tr = document.createElement('tr');
+  tr.dataset.type = entry.type;
+  tr.dataset.id   = entry.id;
+  if (animate) tr.className = 'row-new';
+
+  const statusCls = entry.status >= 500 ? 's5xx' :
+                    entry.status >= 400 ? 's4xx' :
+                    entry.status >= 300 ? 's3xx' :
+                    entry.status >= 200 ? 's2xx' : 's0';
+
+  const latCls = entry.latency_ms > 1000 ? 'lat-slow' :
+                 entry.latency_ms > 300  ? 'lat-mid'  : 'lat-fast';
+
+  tr.innerHTML = `
+    <td class="td-id">${entry.id}</td>
+    <td class="td-time">${entry.timestamp||''}</td>
+    <td><span class="badge badge-${entry.type}">${entry.type}</span></td>
+    <td class="td-method">${entry.method||''}</td>
+    <td class="td-domain" title="${entry.domain||''}">${entry.domain||''}</td>
+    <td class="td-path" title="${entry.path||''}">${entry.path||''}</td>
+    <td class="status-code ${statusCls}">${entry.status||''}</td>
+    <td class="td-bytes">${entry.bytes ? fmtBytes(entry.bytes) : ''}</td>
+    <td class="td-latency ${entry.latency_ms ? latCls : ''}">${entry.latency_ms ? entry.latency_ms.toFixed(0)+'ms' : ''}</td>
+    <td class="td-info" title="${entry.info||''}">${entry.info||''}</td>
+  `;
+  tr.addEventListener('click', () => selectRow(entry, tr));
+  tbody.appendChild(tr);
+
+  if (document.getElementById('auto-scroll').checked) {
+    const wrap = document.getElementById('table-wrap');
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+}
+
+function rebuildTable() {
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  filteredRows = allEntries.filter(matchesFilter);
+  filteredRows.forEach(e => appendRow(e, false));
+  if (filteredRows.length === 0)
+    document.getElementById('empty-state').style.display = 'flex';
+  else
+    document.getElementById('empty-state').style.display = 'none';
+  updateStatusBar();
+}
+
+// ──────────────────────────────────────────────
+//  Selection & Detail Pane
+// ──────────────────────────────────────────────
+function selectRow(entry, tr) {
+  document.querySelectorAll('tbody tr.selected').forEach(r => r.classList.remove('selected'));
+  tr.classList.add('selected');
+  selectedId = entry.id;
+  showDetail(entry);
+}
+
+function showDetail(e) {
+  const pane = document.getElementById('detail-pane');
+  pane.classList.add('open');
+
+  const req = document.getElementById('detail-req');
+  req.innerHTML = detailRow('ID', e.id) +
+    detailRow('Timestamp', e.timestamp) +
+    detailRow('Type', `<span class="badge badge-${e.type}">${e.type}</span>`) +
+    detailRow('Method', `<span class="td-method">${e.method||'—'}</span>`) +
+    detailRow('Domain', e.domain||'—') +
+    detailRow('Path', e.path||'—');
+
+  const statusCls = e.status >= 500 ? 's5xx' : e.status >= 400 ? 's4xx' :
+                    e.status >= 300 ? 's3xx' : e.status >= 200 ? 's2xx' : 's0';
+  const res = document.getElementById('detail-res');
+  res.innerHTML = detailRow('Status', e.status ? `<span class="status-code ${statusCls}">${e.status}</span>` : '—') +
+    detailRow('Bytes', e.bytes ? fmtBytes(e.bytes) : '—') +
+    detailRow('Latency', e.latency_ms ? e.latency_ms.toFixed(2)+'ms' : '—') +
+    detailRow('Info', e.info||'—');
+
+  document.getElementById('detail-raw').textContent = JSON.stringify(e, null, 2);
+}
+
+function detailRow(k, v) {
+  return `<div class="detail-row"><span class="detail-key">${k}</span><span class="detail-value">${v}</span></div>`;
+}
+
+// ──────────────────────────────────────────────
+//  Controls
+// ──────────────────────────────────────────────
+function toggleCapture() {
+  capturing = !capturing;
+  const btn = document.getElementById('btn-capture');
+  btn.textContent = capturing ? '⏸ Pause' : '▶ Resume';
+  btn.className = capturing ? 'btn active' : 'btn';
+}
+
+function clearAll() {
+  allEntries = [];
+  filteredRows = [];
+  document.getElementById('tbody').innerHTML = '';
+  document.getElementById('empty-state').style.display = 'flex';
+  totalBytes = 0; errorCount = 0; cacheHits = 0;
+  Object.keys(counts).forEach(k => counts[k] = 0);
+  updateChipCounts();
+  updateStats();
+  updateStatusBar();
+  document.getElementById('detail-pane').classList.remove('open');
+}
+
+function exportJSON() {
+  const blob = new Blob([JSON.stringify(allEntries, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `proxyshark_${Date.now()}.json`;
+  a.click();
+}
+
+function applyFilter() {
+  textFilter = document.getElementById('filter-input').value;
+  rebuildTable();
+}
+
+function toggleType(type) {
+  if (type === 'ALL') {
+    const allActive = activeTypes.size === 8;
+    if (allActive) {
+      activeTypes.clear();
+    } else {
+      ['CONNECT','MITM','CACHE_HIT','CACHE_MISS','RESPONSE','TUNNEL','TIMEOUT','ERROR'].forEach(t => activeTypes.add(t));
+    }
+  } else {
+    if (activeTypes.has(type)) activeTypes.delete(type);
+    else activeTypes.add(type);
+  }
+  // Update chip UI
+  document.querySelectorAll('.chip[data-type]').forEach(c => {
+    c.classList.toggle('active', activeTypes.has(c.dataset.type));
+  });
+  const allChip = document.querySelector('.chip-all');
+  allChip.classList.toggle('active', activeTypes.size === 8);
+  rebuildTable();
+}
+
+// ──────────────────────────────────────────────
+//  UI updates
+// ──────────────────────────────────────────────
+function updateChipCounts() {
+  let total = 0;
+  Object.entries(counts).forEach(([t, n]) => {
+    const el = document.getElementById('cnt-' + t);
+    if (el) el.textContent = n;
+    total += n;
+  });
+  document.getElementById('cnt-ALL').textContent = total;
+}
+
+function updateStats() {
+  document.getElementById('st-total').textContent  = allEntries.length;
+  document.getElementById('st-errors').textContent = errorCount;
+  document.getElementById('st-cache').textContent  = cacheHits;
+}
+
+function updateStatusBar() {
+  document.getElementById('sb-rows').textContent    = allEntries.length + ' entries';
+  document.getElementById('sb-filtered').textContent = filteredRows.length + ' shown';
+  document.getElementById('sb-bytes').textContent   = fmtBytes(totalBytes) + ' transferred';
+  document.getElementById('sb-time').textContent    = new Date().toLocaleTimeString();
+}
+
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+  return (n/1048576).toFixed(2) + ' MB';
+}
+
+// ──────────────────────────────────────────────
+//  Demo mode
+// ──────────────────────────────────────────────
+const demoDomains = [
+  'api.github.com','www.google.com','accounts.google.com',
+  'cdn.jsdelivr.net','fonts.googleapis.com','chat.openai.com',
+  'api.anthropic.com','s3.amazonaws.com','www.youtube.com',
+  'i.ytimg.com','static.cloudflareinsights.com',
+  'fonts.gstatic.com','analytics.google.com',
+  'www.reddit.com','www.twitter.com','api.stripe.com'
+];
+const demoPaths = ['/api/v1/user','/v1/messages','/static/bundle.js','/api/repos','/cdn/font.woff2',
+                   '/search?q=test','/favicon.ico','/api/events','/feed.json','/v3/query'];
+const demoMethods = ['GET','GET','GET','GET','POST','PUT','DELETE'];
+const demoTypes = ['CONNECT','MITM','CACHE_HIT','CACHE_MISS','RESPONSE','TUNNEL','TIMEOUT','ERROR'];
+const demoWeights = [10, 35, 10, 8, 30, 3, 2, 2];
+let demoCounter = 1;
+
+function weightedRandom(weights) {
+  const total = weights.reduce((a,b)=>a+b,0);
+  let r = Math.random()*total;
+  for (let i=0;i<weights.length;i++) { r-=weights[i]; if(r<=0) return i; }
+  return weights.length-1;
+}
+
+function genDemoEntry() {
+  const typeIdx  = weightedRandom(demoWeights);
+  const type     = demoTypes[typeIdx];
+  const domain   = demoDomains[Math.floor(Math.random()*demoDomains.length)];
+  const path     = demoPaths[Math.floor(Math.random()*demoPaths.length)];
+  const method   = demoMethods[Math.floor(Math.random()*demoMethods.length)];
+  const now      = new Date();
+  const ts       = now.toTimeString().slice(0,8) + '.' + String(now.getMilliseconds()).padStart(3,'0');
+
+  let status = 0, bytes = 0, latency = 0, info = '';
+
+  if (type === 'RESPONSE' || type === 'MITM') {
+    const codes = [200,200,200,204,301,304,400,403,404,500,502];
+    status  = codes[Math.floor(Math.random()*codes.length)];
+    bytes   = Math.floor(Math.random()*500000);
+    latency = Math.random()*2000;
+    info    = '';
+  } else if (type === 'CACHE_HIT') {
+    status = 200; bytes = Math.floor(Math.random()*50000); latency = Math.random()*5; info = 'from cache';
+  } else if (type === 'TIMEOUT') {
+    info = 'connection timed out';
+  } else if (type === 'ERROR') {
+    const errs = ['SSL handshake failed','Connection refused','DNS resolution failed','Broken pipe'];
+    info = errs[Math.floor(Math.random()*errs.length)];
+  }
+
+  return { id: demoCounter++, timestamp: ts, type, method, domain, path, status, bytes, latency_ms: latency, info };
+}
+
+function startDemo() {
+  stopDemo();
+  document.getElementById('demo-banner').style.display = 'block';
+  setStatus(false);
+  document.getElementById('status-text').textContent = 'Demo mode';
+  document.getElementById('status-text').style.color = 'var(--yellow)';
+  document.getElementById('dot').style.background = 'var(--yellow)';
+
+  // initial burst
+  for (let i=0; i<25; i++) ingestEntry(genDemoEntry());
+
+  demoInterval = setInterval(() => {
+    const n = Math.floor(Math.random()*3)+1;
+    for (let i=0;i<n;i++) ingestEntry(genDemoEntry());
+  }, 600);
+}
+
+function stopDemo() {
+  if (demoInterval) { clearInterval(demoInterval); demoInterval = null; }
+}
+
+// ──────────────────────────────────────────────
+//  Resize handle
+// ──────────────────────────────────────────────
+(function() {
+  const handle = document.getElementById('resize-handle');
+  let dragging = false, startY = 0, startH = 0;
+  handle.addEventListener('mousedown', e => {
+    dragging = true;
+    startY = e.clientY;
+    const pane = document.getElementById('detail-pane');
+    startH = pane.offsetHeight;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const pane = document.getElementById('detail-pane');
+    const newH = Math.max(60, Math.min(500, startH - (e.clientY - startY)));
+    pane.style.height = newH + 'px';
+    if (!pane.classList.contains('open')) pane.classList.add('open');
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+})();
+
+// ──────────────────────────────────────────────
+//  Clock
+// ──────────────────────────────────────────────
+setInterval(() => {
+  document.getElementById('sb-time').textContent = new Date().toLocaleTimeString();
+}, 1000);
+
+// ──────────────────────────────────────────────
+//  Boot
+// ──────────────────────────────────────────────
+document.getElementById('empty-state').style.display = 'flex';
+document.getElementById('demo-banner').style.display = 'block';
+
+// Try to connect automatically
+connectWS();
+</script>
+</body>
+</html>
