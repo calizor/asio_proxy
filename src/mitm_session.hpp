@@ -219,13 +219,13 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             *target_ssl_stream_, target_buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    // Вычисляем латентность
                     auto elapsed = std::chrono::steady_clock::now() - self->req_start_;
                     double ms = std::chrono::duration<double, std::milli>(elapsed).count();
 
                     int    status = static_cast<int>(self->current_res_.result_int());
                     size_t bytes  = self->current_res_.body().size();
                     std::string path = std::string(self->current_req_.target());
+                    std::string ct   = std::string(self->current_res_[http::field::content_type]);
 
                     // Кэшируем GET
                     if (self->current_req_.method() == http::verb::get && self->cache_) {
@@ -234,7 +234,23 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
                         self->cache_->put(self->cache_key_, oss.str());
                     }
 
-                    LogServer::instance().log_response(self->target_domain_, path, status, bytes, ms);
+                    // Тело — только для текстовых типов, без gzip, макс. BODY_MAX_BYTES
+                    std::string body;
+                    bool truncated = false;
+                    const std::string encoding = std::string(self->current_res_[http::field::content_encoding]);
+                    const bool is_compressed   = !encoding.empty(); // gzip / br / deflate
+                    if (is_text_content_type(ct) && !is_compressed) {
+                        const std::string& raw = self->current_res_.body();
+                        if (raw.size() > BODY_MAX_BYTES) {
+                            body      = raw.substr(0, BODY_MAX_BYTES);
+                            truncated = true;
+                        } else {
+                            body = raw;
+                        }
+                    }
+
+                    LogServer::instance().log_response(
+                        self->target_domain_, path, status, bytes, ms, ct, body, truncated);
                     self->forward_to_client();
                 } else {
                     LogServer::instance().log_error(self->target_domain_, "Read response: " + ec.message());
