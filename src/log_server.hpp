@@ -155,6 +155,12 @@ public:
         std::cout << "[LogServer] web panel listening on ws://localhost:" << port << "\n";
     }
 
+    // Must be called after ioc.stop() and thread join, but BEFORE ioc destructor.
+    // Releases the acceptor and all sessions so they don't outlive io_context.
+    static void shutdown() {
+        singleton().reset();
+    }
+
     // ── Core log method ──────────────────────────────────────────────────────
     void log(LogEntry entry) {
         entry.id        = counter_++;

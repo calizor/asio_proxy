@@ -55,5 +55,10 @@ int main(int argc, char* argv[]) {
     for (auto& t : v)
         if (t.joinable()) t.join();
 
+    // Release LogServer (and its tcp::acceptor) before ioc is destroyed.
+    // Without this the static shared_ptr outlives ioc and TSan reports
+    // heap-use-after-free inside reactive_socket_service::destroy().
+    LogServer::shutdown();
+
     return EXIT_SUCCESS;
 }
