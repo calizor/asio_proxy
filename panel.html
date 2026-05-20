@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ProxyShark</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#0d0f12; color:#c9d1d9;
+  font-family:'JetBrains Mono','Fira Code',monospace; font-size:12px;
+  height:100vh; display:flex; flex-direction:column; overflow:hidden;
+}
+header {
+  background:#161b22; border-bottom:1px solid #30363d;
+  padding:8px 14px; display:flex; align-items:center; gap:12px; flex-shrink:0;
+}
+header h1 { font-size:14px; font-weight:600; color:#58a6ff; letter-spacing:1px; }
+.dot { width:8px; height:8px; border-radius:50%; background:#f85149; flex-shrink:0; }
+.dot.live { background:#3fb950; animation:blink 1.4s infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+#ws-status { font-size:11px; color:#8b949e; }
+.legend {
+  background:#161b22; border-bottom:1px solid #30363d;
+  padding:5px 14px; display:flex; gap:20px; flex-shrink:0;
+}
+.legend-item { display:flex; align-items:center; gap:6px; font-size:11px; color:#8b949e; }
+.sw { width:12px; height:12px; border-radius:2px; flex-shrink:0; }
+.sw-c { background:#0d1a2a; border:1px solid #388bfd; }
+.sw-p { background:#0a150a; border:1px solid #3fb950; }
+.table-wrap { flex:1; overflow-y:auto; overflow-x:hidden; }
+.table-wrap::-webkit-scrollbar { width:6px; }
+.table-wrap::-webkit-scrollbar-track { background:#0d0f12; }
+.table-wrap::-webkit-scrollbar-thumb { background:#30363d; border-radius:3px; }
+table { width:100%; border-collapse:collapse; table-layout:fixed; }
+thead { position:sticky; top:0; z-index:5; }
+th {
+  background:#161b22; border-bottom:2px solid #30363d;
+  color:#8b949e; font-size:10px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px; padding:5px 8px; text-align:left;
+}
+.cn{width:48px} .ct{width:88px} .cd{width:80px} .cm{width:62px}
+.ch{width:200px} .cp{width:auto} .cs{width:52px} .cz{width:72px} .cl{width:68px}
+tbody tr { border-bottom:1px solid rgba(48,54,61,.5); cursor:pointer; transition:filter .08s; }
+tbody tr:hover { filter:brightness(1.45); }
+tbody tr.sel { outline:1px solid #388bfd; outline-offset:-1px; }
+tr.client { background:#0d1a2a; }
+tr.proxy  { background:#0a150a; }
+tr.err    { background:#1a0808 !important; }
+tr.tout   { background:#1a1000 !important; }
+td { padding:3px 8px; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }
+.tn { color:#484f58; font-size:10px; }
+.tt { color:#8b949e; }
+.badge { display:inline-block; padding:1px 5px; border-radius:2px; font-size:9px; font-weight:700; letter-spacing:.3px; }
+.bc { background:#0d2040; color:#58a6ff; border:1px solid #1f4080; }
+.br { background:#0d2040; color:#79c0ff; border:1px solid #1a3a6a; }
+.bp { background:#0a180a; color:#56d364; border:1px solid #1a3a1a; }
+.bh { background:#051520; color:#39c5cf; border:1px solid #0a2a3a; }
+.bt { background:#1a1030; color:#a78bfa; border:1px solid #2a1a4a; }
+.bo { background:#1a1000; color:#e3b341; border:1px solid #3a2800; }
+.be { background:#1a0505; color:#f85149; border:1px solid #3a1010; }
+.tm { color:#e3b341; font-weight:600; font-size:10px; }
+.th { color:#c9d1d9; }
+.tp { color:#8b949e; font-size:10px; }
+.st { font-weight:600; }
+.s2{color:#3fb950} .s3{color:#58a6ff} .s4{color:#e3b341} .s5{color:#f85149}
+.tz { color:#8b949e; text-align:right; font-size:10px; }
+.tl { text-align:right; font-size:10px; }
+.lf{color:#3fb950} .lm{color:#e3b341} .ls{color:#f85149}
+.detail {
+  height:0; overflow:hidden; border-top:1px solid #30363d;
+  background:#161b22; flex-shrink:0; display:flex; flex-direction:column;
+  transition:height .18s ease;
+}
+.detail.open { height:220px; }
+.dtabs {
+  display:flex; background:#161b22; border-bottom:1px solid #30363d;
+  flex-shrink:0; cursor:ns-resize; user-select:none;
+}
+.dtab {
+  background:none; border:none; border-bottom:2px solid transparent;
+  color:#8b949e; font-family:inherit; font-size:11px;
+  padding:5px 12px; cursor:pointer; transition:all .12s;
+}
+.dtab:hover { color:#c9d1d9; }
+.dtab.on { color:#58a6ff; border-bottom-color:#58a6ff; }
+.dbody { flex:1; overflow:hidden; display:flex; }
+.mpane { display:flex; flex:1; overflow:hidden; }
+.mcol { flex:1; padding:8px 12px; overflow-y:auto; border-right:1px solid #30363d; }
+.mcol:last-child { border-right:none; }
+.mcol::-webkit-scrollbar { width:4px; }
+.mcol::-webkit-scrollbar-thumb { background:#30363d; }
+.mtitle { font-size:10px; font-weight:700; color:#58a6ff; text-transform:uppercase; letter-spacing:.8px; margin-bottom:6px; padding-bottom:3px; border-bottom:1px solid #30363d; }
+.mr { display:flex; gap:8px; padding:2px 0; }
+.mk { color:#8b949e; min-width:90px; flex-shrink:0; font-size:11px; }
+.mv { color:#c9d1d9; font-size:11px; word-break:break-all; }
+.bpane { display:none; flex:1; overflow:hidden; flex-direction:column; }
+.bpane.on { display:flex; }
+.bbar {
+  padding:4px 10px; background:#161b22; border-bottom:1px solid #30363d;
+  display:flex; gap:8px; align-items:center; flex-shrink:0; font-size:10px; color:#8b949e;
+}
+.bbar button {
+  background:#21262d; border:1px solid #30363d; color:#8b949e;
+  font-family:inherit; font-size:10px; padding:2px 8px; cursor:pointer; border-radius:2px;
+}
+.bbar button:hover { color:#c9d1d9; }
+.bscroll { flex:1; overflow:auto; }
+.bscroll::-webkit-scrollbar { width:6px; height:6px; }
+.bscroll::-webkit-scrollbar-thumb { background:#30363d; border-radius:3px; }
+#bpre { margin:0; padding:10px; font-family:inherit; font-size:11px; line-height:1.5; color:#c9d1d9; white-space:pre; tab-size:2; }
+.hk{color:#79c0ff} .hs{color:#a5d6ff} .hn{color:#f8c555} .hb{color:#ff7b72} .hta{color:#7ee787} .ha{color:#ffab70} .hc{color:#8b949e;font-style:italic}
+footer { background:#161b22; border-top:1px solid #30363d; padding:3px 14px; display:flex; gap:16px; font-size:10px; color:#484f58; flex-shrink:0; }
+footer span { color:#8b949e; }
+@keyframes fi { from{opacity:0;background:rgba(88,166,255,.07)} to{opacity:1} }
+.new { animation:fi .3s ease; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>&#x1F988; ProxyShark</h1>
+  <div class="dot" id="dot"></div>
+  <span id="ws-status">connecting...</span>
+</header>
+
+<div class="legend">
+  <div class="legend-item"><div class="sw sw-c"></div>Browser &harr; Proxy</div>
+  <div class="legend-item"><div class="sw sw-p"></div>Proxy &harr; Server</div>
+</div>
+
+<div class="table-wrap" id="wrap">
+  <table>
+    <thead><tr>
+      <th class="cn">#</th><th class="ct">Time</th><th class="cd">Direction</th>
+      <th class="cm">Method</th><th class="ch">Host</th><th class="cp">Path</th>
+      <th class="cs">Status</th><th class="cz">Size</th><th class="cl">Latency</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<div class="detail" id="detail">
+  <div class="dtabs" id="dtabs">
+    <button class="dtab on" id="dtab-meta" onclick="showTab('meta')">Meta</button>
+    <button class="dtab"    id="dtab-body" onclick="showTab('body')">Body</button>
+  </div>
+  <div class="dbody">
+    <div class="mpane" id="pane-meta">
+      <div class="mcol"><div class="mtitle">Request</div><div id="d-req"></div></div>
+      <div class="mcol"><div class="mtitle">Response</div><div id="d-res"></div></div>
+    </div>
+    <div class="bpane" id="pane-body">
+      <div class="bbar">
+        <span id="bct">no body</span>
+        <span id="bwarn" style="color:#e3b341;display:none;">&#x26A0; truncated 64KB</span>
+        <button onclick="copyBody()" style="margin-left:auto;">Copy</button>
+        <button id="btnwrap" onclick="toggleWrap()">Wrap</button>
+      </div>
+      <div class="bscroll"><pre id="bpre"></pre></div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <span id="ftotal">0 packets</span>
+  <span id="ftime"></span>
+</footer>
+
+<script>
+var rows = [], ws = null, curtab = 'meta', wrapped = false;
+
+var BADGES = {
+  CONNECT:    ['bc','CONNECT'],  MITM:      ['br','REQUEST'],
+  RESPONSE:   ['bp','RESPONSE'], CACHE_HIT: ['bh','CACHE HIT'],
+  CACHE_MISS: ['bh','CACHE MISS'], TUNNEL:  ['bt','TUNNEL'],
+  TIMEOUT:    ['bo','TIMEOUT'],  ERROR:     ['be','ERROR']
+};
+
+function side(type) {
+  return (type === 'CONNECT' || type === 'MITM') ? 'client' : 'proxy';
+}
+
+function connect() {
+  try { ws = new WebSocket('ws://localhost:8081'); } catch(e) { retry(); return; }
+  ws.onopen = function() {
+    document.getElementById('dot').className = 'dot live';
+    document.getElementById('ws-status').textContent = 'live  ws://localhost:8081';
+    document.getElementById('ws-status').style.color = '#3fb950';
+  };
+  ws.onmessage = function(e) { try { addRow(JSON.parse(e.data)); } catch(x) {} };
+  ws.onclose = ws.onerror = function() {
+    document.getElementById('dot').className = 'dot';
+    document.getElementById('ws-status').textContent = 'disconnected -- retry in 3s';
+    document.getElementById('ws-status').style.color = '#f85149';
+    retry();
+  };
+}
+function retry() { setTimeout(connect, 3000); }
+
+function addRow(e) {
+  rows.push(e);
+  var b  = BADGES[e.type] || ['bc', e.type];
+  var s  = side(e.type);
+  var sc = !e.status ? '' : e.status<300?'s2':e.status<400?'s3':e.status<500?'s4':'s5';
+  var lc = !e.latency_ms ? '' : e.latency_ms<300?'lf':e.latency_ms<1000?'lm':'ls';
+  var ex = e.type==='ERROR'?' err':e.type==='TIMEOUT'?' tout':'';
+
+  var tr = document.createElement('tr');
+  tr.className = s + ex + ' new';
+  tr.innerHTML =
+    '<td class="tn">'+e.id+'</td>'+
+    '<td class="tt">'+(e.timestamp||'')+'</td>'+
+    '<td><span class="badge '+b[0]+'">'+b[1]+'</span></td>'+
+    '<td class="tm">'+esc(e.method||'')+'</td>'+
+    '<td class="th" title="'+esc(e.domain||'')+'">'+esc(e.domain||'')+'</td>'+
+    '<td class="tp" title="'+esc(e.path||'')+'">'+esc(e.path||'')+'</td>'+
+    '<td class="st '+sc+'">'+(e.status||'')+'</td>'+
+    '<td class="tz">'+(e.bytes?fmt(e.bytes):'')+'</td>'+
+    '<td class="tl '+lc+'">'+(e.latency_ms?e.latency_ms.toFixed(0)+'ms':'')+'</td>';
+
+  tr.addEventListener('click', function(){ pick(e, tr); });
+  document.getElementById('tbody').appendChild(tr);
+  var w = document.getElementById('wrap');
+  w.scrollTop = w.scrollHeight;
+  document.getElementById('ftotal').textContent = rows.length + ' packets';
+}
+
+function pick(e, tr) {
+  document.querySelectorAll('tbody tr.sel').forEach(function(r){ r.classList.remove('sel'); });
+  tr.classList.add('sel');
+  renderDetail(e);
+}
+
+function renderDetail(e) {
+  document.getElementById('detail').classList.add('open');
+  var sc = !e.status?'':e.status<300?'s2':e.status<400?'s3':e.status<500?'s4':'s5';
+  var b  = BADGES[e.type]||['',''];
+
+  document.getElementById('d-req').innerHTML =
+    mr('ID', e.id) + mr('Time', e.timestamp||'') +
+    mr('Type','<span class="badge '+b[0]+'">'+e.type+'</span>') +
+    mr('Method','<span class="tm">'+esc(e.method||'&mdash;')+'</span>') +
+    mr('Host', esc(e.domain||'&mdash;')) + mr('Path', esc(e.path||'&mdash;'));
+
+  document.getElementById('d-res').innerHTML =
+    mr('Status', e.status?'<span class="st '+sc+'">'+e.status+'</span>':'&mdash;') +
+    mr('Size',   e.bytes?fmt(e.bytes):'&mdash;') +
+    mr('Latency',e.latency_ms?e.latency_ms.toFixed(2)+'ms':'&mdash;') +
+    mr('Content-Type', esc(e.content_type||'&mdash;')) +
+    mr('Info', esc(e.info||'&mdash;'));
+
+  var ct = e.content_type||'', body = e.body||'';
+  document.getElementById('bct').textContent = ct || 'no body';
+  document.getElementById('bwarn').style.display = e.body_truncated ? 'inline' : 'none';
+
+  var pre = document.getElementById('bpre');
+  pre.style.whiteSpace = wrapped ? 'pre-wrap' : 'pre';
+  if (body.length) {
+    pre.innerHTML = hl(body, ct);
+    showTab('body');
+  } else {
+    var why = ct ? (/text\/|application\/(json|javascript|xml|xhtml)/.test(ct)
+      ? 'body is empty' : 'binary/compressed') : 'no body';
+    pre.innerHTML = '<span style="color:#484f58;font-style:italic;">'+why+'</span>';
+    showTab('meta');
+  }
+}
+
+function showTab(name) {
+  curtab = name;
+  document.getElementById('dtab-meta').classList.toggle('on', name==='meta');
+  document.getElementById('dtab-body').classList.toggle('on', name==='body');
+  document.getElementById('pane-meta').style.display = name==='meta' ? 'flex' : 'none';
+  var bp = document.getElementById('pane-body');
+  if (name === 'body') bp.classList.add('on'); else bp.classList.remove('on');
+}
+
+function hl(code, ct) {
+  if (ct.indexOf('json')>=0)       return hlJSON(code);
+  if (ct.indexOf('html')>=0)       return hlHTML(code);
+  if (ct.indexOf('css')>=0)        return hlCSS(code);
+  if (ct.indexOf('javascript')>=0) return hlJS(code);
+  return esc(code);
+}
+function hlJSON(c) {
+  var s; try { s=JSON.stringify(JSON.parse(c),null,2); } catch(e){ return esc(c); }
+  return s.replace(/("(?:\\.|[^"\\])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,function(m){
+    if(/^"/.test(m)) return /:$/.test(m)?'<span class="hk">'+esc(m)+'</span>':'<span class="hs">'+esc(m)+'</span>';
+    if(/true|false|null/.test(m)) return '<span class="hb">'+esc(m)+'</span>';
+    return '<span class="hn">'+esc(m)+'</span>';
+  });
+}
+function hlHTML(c) {
+  return esc(c)
+    .replace(/(&lt;!--[\s\S]*?--&gt;)/g,'<span class="hc">$1</span>')
+    .replace(/(&lt;\/)([\w.-]+)(&gt;)/g,'$1<span class="hta">$2</span>$3')
+    .replace(/(&lt;)([\w.-]+)/g,'$1<span class="hta">$2</span>')
+    .replace(/([\w:-]+)(=)(&quot;[^&]*&quot;)/g,'<span class="ha">$1</span>$2<span class="hs">$3</span>');
+}
+function hlCSS(c) {
+  return esc(c)
+    .replace(/(\/\*[\s\S]*?\*\/)/g,'<span class="hc">$1</span>')
+    .replace(/([\w-]+)(\s*:\s*)([^;{}]+)(;)/g,'<span class="hk">$1</span>$2<span class="hs">$3</span>$4');
+}
+function hlJS(c) {
+  return esc(c)
+    .replace(/(\/\/[^\n]*)/g,'<span class="hc">$1</span>')
+    .replace(/\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|new|this|typeof)\b/g,'<span class="hb">$1</span>')
+    .replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g,'<span class="hs">$1</span>')
+    .replace(/\b(\d+(?:\.\d+)?)\b/g,'<span class="hn">$1</span>');
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function fmt(n){ return n<1024?n+'B':n<1048576?(n/1024).toFixed(1)+'KB':(n/1048576).toFixed(1)+'MB'; }
+function mr(k,v){ return '<div class="mr"><span class="mk">'+k+'</span><span class="mv">'+v+'</span></div>'; }
+function copyBody(){ var t=document.getElementById('bpre').textContent; if(navigator.clipboard)navigator.clipboard.writeText(t).catch(function(){}); }
+function toggleWrap(){
+  wrapped=!wrapped;
+  document.getElementById('bpre').style.whiteSpace=wrapped?'pre-wrap':'pre';
+  document.getElementById('btnwrap').style.color=wrapped?'#58a6ff':'';
+}
+
+(function(){
+  var det=document.getElementById('detail'), drag=false, y0=0, h0=0;
+  document.getElementById('dtabs').addEventListener('mousedown',function(e){
+    if(e.target.tagName==='BUTTON') return;
+    drag=true; y0=e.clientY; h0=det.offsetHeight; e.preventDefault();
+  });
+  document.addEventListener('mousemove',function(e){ if(!drag)return; var h=Math.max(60,Math.min(600,h0-(e.clientY-y0))); det.style.height=h+'px'; det.classList.add('open'); });
+  document.addEventListener('mouseup',function(){ drag=false; });
+})();
+
+setInterval(function(){ document.getElementById('ftime').textContent=new Date().toLocaleTimeString(); },1000);
+connect();
+</script>
+</body>
+</html>

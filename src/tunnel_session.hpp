@@ -7,16 +7,11 @@
 #include <memory>
 #include <string>
 
-#include "lru_cache.hpp"  // Только для единого интерфейса с MitmSession
+#include "log_server.hpp"
+#include "lru_cache.hpp"
 
 namespace asio = boost::asio;
 using tcp      = asio::ip::tcp;
-
-// TunnelSession — слепой TCP-туннель (CONNECT без MITM).
-// Просто пробрасывает байты между браузером и целевым сервером.
-//
-// Контракт: ConnectionHandler уже отправил "200 Connection Established"
-// до передачи сокета сюда.
 
 class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     tcp::socket   client_socket_;
@@ -30,8 +25,6 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     boost::asio::steady_timer deadline_;
 
    public:
-    // cache игнорируется — туннель не умеет кэшировать,
-    // параметр нужен только чтобы ConnectionHandler мог использовать единый шаблон.
     TunnelSession(tcp::socket socket, std::string domain, std::shared_ptr<LRUCache> /*cache*/ = nullptr)
         : client_socket_(std::move(socket)),
           target_socket_(client_socket_.get_executor()),
@@ -49,10 +42,9 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
         deadline_.expires_after(std::chrono::seconds(30));
         auto self = shared_from_this();
         deadline_.async_wait([self](boost::system::error_code ec) {
-            if (ec == boost::asio::error::operation_aborted)
-                return;
+            if (ec == boost::asio::error::operation_aborted) return;
             if (!ec) {
-                std::cout << "[TIMEOUT] " << self->target_domain_ << "\n";
+                LogServer::instance().log_timeout(self->target_domain_);
                 self->close();
             }
         });
@@ -67,18 +59,27 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
                     asio::async_connect(
                         self->target_socket_, results,
                         [self](boost::system::error_code ec, const tcp::endpoint&) {
-                            if (!ec)
+                            if (!ec) {
+                                // Логируем туннель
+                                LogEntry e;
+                                e.type   = "TUNNEL";
+                                e.method = "CONNECT";
+                                e.domain = self->target_domain_;
+                                e.info   = "blind tunnel";
+                                LogServer::instance().log(std::move(e));
                                 self->start_pipe();
-                            else
+                            } else {
+                                LogServer::instance().log_error(self->target_domain_, "Tunnel connect: " + ec.message());
                                 self->close();
+                            }
                         });
                 } else {
+                    LogServer::instance().log_error(self->target_domain_, "Tunnel DNS: " + ec.message());
                     self->close();
                 }
             });
     }
 
-    // Запускаем двунаправленный пайп: оба направления стартуют одновременно
     void start_pipe() {
         pipe_client_to_target();
         pipe_target_to_client();
@@ -94,10 +95,8 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
                     asio::async_write(
                         self->target_socket_, asio::buffer(self->client_buf_, n),
                         [self](boost::system::error_code ec, std::size_t) {
-                            if (!ec)
-                                self->pipe_client_to_target();
-                            else
-                                self->close();
+                            if (!ec) self->pipe_client_to_target();
+                            else     self->close();
                         });
                 } else {
                     self->close();
@@ -115,10 +114,8 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
                     asio::async_write(
                         self->client_socket_, asio::buffer(self->target_buf_, n),
                         [self](boost::system::error_code ec, std::size_t) {
-                            if (!ec)
-                                self->pipe_target_to_client();
-                            else
-                                self->close();
+                            if (!ec) self->pipe_target_to_client();
+                            else     self->close();
                         });
                 } else {
                     self->close();
