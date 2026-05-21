@@ -126,12 +126,23 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
         LogServer::instance().log_mitm(method, target_domain_, path);
 
         if (current_req_.method() == http::verb::get && cache_) {
-            if (auto hit = cache_->get(cache_key_)) {
+            // Проверяем директивы Cache-Control / Pragma в запросе клиента
+            const std::string cc_req     = std::string(current_req_[http::field::cache_control]);
+            const std::string pragma_req = std::string(current_req_[http::field::pragma]);
+
+            if (cache_control::request_bypasses_cache(cc_req, pragma_req)) {
+                // Клиент требует свежий ответ — инвалидируем запись и идём к серверу
+                cache_->invalidate(cache_key_);
+                LogServer::instance().log({.type = "CACHE_BYPASS", .method = "GET",
+                                           .domain = target_domain_, .path = path,
+                                           .info = "cache bypassed by request directive"});
+            } else if (auto hit = cache_->get(cache_key_)) {
                 LogServer::instance().log_cache_hit(target_domain_, path);
                 send_cached_response(*hit);
                 return;
+            } else {
+                LogServer::instance().log_cache_miss(target_domain_);
             }
-            LogServer::instance().log_cache_miss(target_domain_);
         }
 
         if (target_socket_.is_open()) {
@@ -198,6 +209,7 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
     void forward_to_target() {
         auto self = shared_from_this();
         current_req_.set(http::field::host, target_domain_);
+        reset_deadline();
 
         http::async_write(
             *target_ssl_stream_, current_req_,
@@ -214,31 +226,44 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
     void read_target_response() {
         auto self = shared_from_this();
         current_res_.clear();
+        reset_deadline();
 
         http::async_read(
             *target_ssl_stream_, target_buffer_, current_res_,
             [self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
-                    auto elapsed = std::chrono::steady_clock::now() - self->req_start_;
-                    double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                    auto   elapsed = std::chrono::steady_clock::now() - self->req_start_;
+                    double ms      = std::chrono::duration<double, std::milli>(elapsed).count();
 
-                    int    status = static_cast<int>(self->current_res_.result_int());
-                    size_t bytes  = self->current_res_.body().size();
-                    std::string path = std::string(self->current_req_.target());
-                    std::string ct   = std::string(self->current_res_[http::field::content_type]);
+                    int         status = static_cast<int>(self->current_res_.result_int());
+                    std::size_t bytes  = self->current_res_.body().size();
+                    std::string path   = std::string(self->current_req_.target());
+                    std::string ct     = std::string(self->current_res_[http::field::content_type]);
 
-                    // Кэшируем GET
-                    if (self->current_req_.method() == http::verb::get && self->cache_) {
-                        std::ostringstream oss;
-                        oss << self->current_res_;
-                        self->cache_->put(self->cache_key_, oss.str());
+                    // Кэшируем GET-ответ с учётом Cache-Control директив ответа
+                    if (self->current_req_.method() == http::verb::get && self->cache_ && status == 200) {
+                        const std::string cc_res     = std::string(self->current_res_[http::field::cache_control]);
+                        const std::string pragma_res = std::string(self->current_res_[http::field::pragma]);
+
+                        if (cache_control::response_is_storable(cc_res, pragma_res)) {
+                            std::ostringstream oss;
+                            oss << self->current_res_;
+
+                            // Вычисляем TTL из max-age / s-maxage (0 = бессрочно)
+                            long max_age_s = cache_control::max_age_seconds(cc_res);
+                            std::chrono::seconds ttl{max_age_s > 0 ? max_age_s : 0};
+
+                            self->cache_->put(self->cache_key_, oss.str(), ttl);
+                        }
                     }
 
-                    // Тело — только для текстовых типов, без gzip, макс. BODY_MAX_BYTES
+                    // Тело — только для текстовых типов без сжатия, макс. BODY_MAX_BYTES
                     std::string body;
-                    bool truncated = false;
-                    const std::string encoding = std::string(self->current_res_[http::field::content_encoding]);
-                    const bool is_compressed   = !encoding.empty(); // gzip / br / deflate
+                    bool        truncated = false;
+                    const std::string encoding =
+                        std::string(self->current_res_[http::field::content_encoding]);
+                    const bool is_compressed = !encoding.empty();
+
                     if (is_text_content_type(ct) && !is_compressed) {
                         const std::string& raw = self->current_res_.body();
                         if (raw.size() > BODY_MAX_BYTES) {
@@ -251,6 +276,18 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
 
                     LogServer::instance().log_response(
                         self->target_domain_, path, status, bytes, ms, ct, body, truncated);
+
+                    // Если сервер закрывает соединение — сбрасываем target,
+                    // чтобы следующий запрос прошёл через reconnect
+                    if (!self->current_res_.keep_alive()) {
+                        boost::system::error_code tec;
+                        if (self->target_ssl_stream_)
+                            self->target_ssl_stream_->shutdown(tec);
+                        self->target_socket_.close(tec);
+                        self->target_ssl_stream_.reset();
+                        self->target_buffer_.clear();
+                    }
+
                     self->forward_to_client();
                 } else {
                     LogServer::instance().log_error(self->target_domain_, "Read response: " + ec.message());
@@ -267,10 +304,10 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             *client_ssl_stream_, *res_ptr,
             [self, res_ptr](boost::system::error_code ec, std::size_t) {
                 if (ec) { self->close(); return; }
-                if (res_ptr->keep_alive())
-                    self->read_client_request();
-                else
-                    self->close();
+                // Всегда ждём следующего запроса от клиента,
+                // таймер 15 секунд — единственный критерий закрытия
+                self->reset_deadline(std::chrono::seconds(15));
+                self->read_client_request();
             });
     }
 
