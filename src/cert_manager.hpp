@@ -65,23 +65,21 @@ class CertManager {
 public:
     // Возвращает готовый ssl::context для domain, создавая его при
     // необходимости. nullptr — при неустранимой ошибке (лог уже записан).
+    //
+    // Реализация намеренно использует один lock_guard, а не «double-checked
+    // locking»: оба лока всё равно были бы exclusive на одном и том же
+    // std::mutex, так что DCL здесь не давал выигрыша — только лишнюю пару
+    // lock/unlock и иллюзию оптимизации.
+    //
+    // Узкое место: build_and_cache_context (RSA-keygen + подпись X.509)
+    // выполняется под локом, то есть первые запросы к разным новым доменам
+    // сериализуются. Для прогретого кэша это незаметно. Если станет важно —
+    // переходить на shared_mutex + per-domain promise/future.
     static std::shared_ptr<boost::asio::ssl::context>
     get_context_for_domain(const std::string& domain) {
-        // ── Быстрый путь: проверка in-memory кэша под коротким локом ─────────
-        {
-            std::lock_guard lock(s_mutex);
-            if (auto it = s_ctx_cache.find(domain); it != s_ctx_cache.end())
-                return it->second;
-        }
-
-        // ── Медленный путь: повторная проверка + при необходимости генерация ─
-        // Между двумя локами другой поток мог уже сгенерировать наш домен,
-        // поэтому проверяем повторно перед тем как запускать build.
         std::lock_guard lock(s_mutex);
-
         if (auto it = s_ctx_cache.find(domain); it != s_ctx_cache.end())
             return it->second;
-
         return build_and_cache_context(domain);
     }
 
