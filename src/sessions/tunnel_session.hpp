@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <iostream>
@@ -23,6 +24,7 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     std::array<char, 8192> target_buf_;
 
     boost::asio::steady_timer deadline_;
+    std::atomic<bool>         closed_{false};
 
    public:
     TunnelSession(tcp::socket socket, std::string domain, std::shared_ptr<LRUCache> /*cache*/ = nullptr)
@@ -124,6 +126,8 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     }
 
     void close() {
+        // Guard against concurrent calls from both pipe directions.
+        if (closed_.exchange(true)) return;
         boost::system::error_code ec;
         deadline_.cancel();
         if (client_socket_.is_open()) {

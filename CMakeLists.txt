@@ -15,6 +15,7 @@ target_compile_features(server PUBLIC cxx_std_17)
 
 target_include_directories(server PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sessions
     ${Boost_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIR}
 )

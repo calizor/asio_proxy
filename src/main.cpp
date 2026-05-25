@@ -6,12 +6,14 @@
 #include <thread>
 #include <vector>
 
+#include "domain_config.hpp"
 #include "lru_cache.hpp"
 #include "proxy_server.hpp"
 #include "log_server.hpp"
 
-#define PROXY_PORT 8080
-#define LOG_PORT   8081
+#define PROXY_PORT   8080
+#define LOG_PORT     8081
+#define CONFIG_FILE  "proxy.conf"
 
 namespace asio = boost::asio;
 
@@ -28,9 +30,12 @@ int main(int argc, char* argv[]) {
     LogServer::init(ioc, LOG_PORT);
     std::cout << "[SERVER] Веб-панель: открой panel.html в браузере\n";
 
+    // ── Загружаем конфигурацию доменов ──
+    auto config = DomainConfig::load(CONFIG_FILE);
+
     // ── Запускаем прокси ──
     auto global_cache = std::make_shared<LRUCache>(1000);
-    std::make_shared<ProxyServer>(ioc, PROXY_PORT, global_cache)->do_accept();
+    std::make_shared<ProxyServer>(ioc, PROXY_PORT, global_cache, config)->do_accept();
     std::cout << "[SERVER] Прокси слушает на порту " << PROXY_PORT << "\n";
 
     asio::signal_set signals(ioc, SIGINT, SIGTERM);
