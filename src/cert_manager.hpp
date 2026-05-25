@@ -17,25 +17,26 @@
 #include <unordered_map>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RAII smart-pointer aliases for OpenSSL C objects.
-//  Each deleter is a stateless lambda stored in the unique_ptr type,
-//  so there is zero overhead compared to calling the free-function directly.
+//  RAII-обёртки для C-объектов OpenSSL.
+//
+//  Каждый делитер — stateless-функтор, хранится в типе unique_ptr,
+//  поэтому накладных расходов по сравнению с прямым вызовом free-функции нет.
 // ─────────────────────────────────────────────────────────────────────────────
 namespace ssl_detail {
 
-struct X509Deleter    { void operator()(X509*     p) const noexcept { X509_free(p);         } };
-struct EVPKeyDeleter  { void operator()(EVP_PKEY* p) const noexcept { EVP_PKEY_free(p);     } };
-struct EVPPkeyCtxDeleter { void operator()(EVP_PKEY_CTX* p) const noexcept { EVP_PKEY_CTX_free(p); } };
-struct X509ExtDeleter { void operator()(X509_EXTENSION* p) const noexcept { X509_EXTENSION_free(p); } };
-struct FileDeleter    { void operator()(FILE* p) const noexcept { if (p) std::fclose(p);    } };
+struct X509Deleter       { void operator()(X509*           p) const noexcept { X509_free(p);           } };
+struct EVPKeyDeleter     { void operator()(EVP_PKEY*       p) const noexcept { EVP_PKEY_free(p);       } };
+struct EVPPkeyCtxDeleter { void operator()(EVP_PKEY_CTX*   p) const noexcept { EVP_PKEY_CTX_free(p);   } };
+struct X509ExtDeleter    { void operator()(X509_EXTENSION* p) const noexcept { X509_EXTENSION_free(p); } };
+struct FileDeleter       { void operator()(FILE*           p) const noexcept { if (p) std::fclose(p); } };
 
-using UniqueX509     = std::unique_ptr<X509,            X509Deleter>;
-using UniqueEVPKey   = std::unique_ptr<EVP_PKEY,        EVPKeyDeleter>;
-using UniqueEVPPkeyCtx = std::unique_ptr<EVP_PKEY_CTX,  EVPPkeyCtxDeleter>;
-using UniqueX509Ext  = std::unique_ptr<X509_EXTENSION,  X509ExtDeleter>;
-using UniqueFile     = std::unique_ptr<FILE,             FileDeleter>;
+using UniqueX509       = std::unique_ptr<X509,            X509Deleter>;
+using UniqueEVPKey     = std::unique_ptr<EVP_PKEY,        EVPKeyDeleter>;
+using UniqueEVPPkeyCtx = std::unique_ptr<EVP_PKEY_CTX,    EVPPkeyCtxDeleter>;
+using UniqueX509Ext    = std::unique_ptr<X509_EXTENSION,  X509ExtDeleter>;
+using UniqueFile       = std::unique_ptr<FILE,            FileDeleter>;
 
-// Convenience: open a FILE and wrap it immediately, throws on failure.
+// Открывает файл и оборачивает в UniqueFile. Бросает исключение при ошибке.
 inline UniqueFile open_file(const std::string& path, const char* mode) {
     UniqueFile f(std::fopen(path.c_str(), mode));
     if (!f)
@@ -43,34 +44,39 @@ inline UniqueFile open_file(const std::string& path, const char* mode) {
     return f;
 }
 
-} // namespace ssl_detail
+}  // namespace ssl_detail
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CertManager
+//  CertManager — генерация, кэширование и выдача ssl::context для MITM.
 //
-//  Generates, caches, and serves SSL contexts for MITM interception.
+//  Двухуровневый кэш:
+//    L1 — in-memory map (готовые ssl::context, самый быстрый путь).
+//    L2 — файловая система (PEM-файлы в certs/, переживают рестарт).
 //
-//  Two-level cache:
-//    L1 – in-memory map (ssl::context objects, fastest path)
-//    L2 – file system  (PEM files in certs/, survives restarts)
+//  Потокобезопасность: глобальный std::mutex + double-checked locking.
+//  Все методы статические — у класса нет состояния экземпляра.
 //
-//  Thread safety: Double-Checked Locking with a single std::mutex.
-//  All methods are static; the class has no instance state.
+//  Замечание: текущая реализация держит лок на всё время генерации
+//  сертификата, что сериализует первый запрос к каждому домену.
+//  Это не критично в типичном использовании (одна генерация ~50мс),
+//  но при массовом потоке новых доменов может стать узким местом.
 // ─────────────────────────────────────────────────────────────────────────────
 class CertManager {
 public:
-    // Returns a ready-to-use ssl::context for `domain`, creating it if needed.
-    // Returns nullptr on unrecoverable error (log already written).
+    // Возвращает готовый ssl::context для domain, создавая его при
+    // необходимости. nullptr — при неустранимой ошибке (лог уже записан).
     static std::shared_ptr<boost::asio::ssl::context>
     get_context_for_domain(const std::string& domain) {
-        // ── Fast path: check in-memory cache without locking ─────────────────
+        // ── Быстрый путь: проверка in-memory кэша под коротким локом ─────────
         {
             std::lock_guard lock(s_mutex);
             if (auto it = s_ctx_cache.find(domain); it != s_ctx_cache.end())
                 return it->second;
         }
 
-        // ── Slow path: lock, re-check, then generate if still absent ─────────
+        // ── Медленный путь: повторная проверка + при необходимости генерация ─
+        // Между двумя локами другой поток мог уже сгенерировать наш домен,
+        // поэтому проверяем повторно перед тем как запускать build.
         std::lock_guard lock(s_mutex);
 
         if (auto it = s_ctx_cache.find(domain); it != s_ctx_cache.end())
@@ -80,18 +86,18 @@ public:
     }
 
 private:
-    // Inline static storage (C++17) — no separate .cpp needed.
+    // Inline static storage (C++17) — не требует отдельного .cpp.
     static inline std::mutex s_mutex;
     static inline std::unordered_map<
         std::string,
         std::shared_ptr<boost::asio::ssl::context>
     > s_ctx_cache;
 
-    static constexpr const char* CERT_DIR   = "certs/";
-    static constexpr const char* CA_CRT     = "rootCA.crt";
-    static constexpr const char* CA_KEY     = "rootCA.key";
+    static constexpr const char* CERT_DIR = "certs/";
+    static constexpr const char* CA_CRT   = "rootCA.crt";
+    static constexpr const char* CA_KEY   = "rootCA.key";
 
-    // ── Context construction ─────────────────────────────────────────────────
+    // ── Сборка ssl::context для одного домена ────────────────────────────────
     static std::shared_ptr<boost::asio::ssl::context>
     build_and_cache_context(const std::string& domain) {
         namespace ssl = boost::asio::ssl;
@@ -101,20 +107,20 @@ private:
         const std::string cert_path = std::string(CERT_DIR) + domain + ".crt";
         const std::string key_path  = std::string(CERT_DIR) + domain + ".key";
 
-        // Generate certificate files if they don't exist yet.
+        // Если для домена ещё нет PEM-файлов — генерируем сертификат и ключ.
         if (!std::filesystem::exists(cert_path) || !std::filesystem::exists(key_path)) {
-            std::cout << "[CertManager] Generating certificate for: " << domain << "\n";
+            std::cout << "[CertManager] Генерируем сертификат для: " << domain << "\n";
             if (!generate_x509(domain, cert_path, key_path, CA_CRT, CA_KEY)) {
-                std::cerr << "[CertManager] Failed to generate certificate for: " << domain << "\n";
+                std::cerr << "[CertManager] Не удалось сгенерировать сертификат для: " << domain << "\n";
                 return nullptr;
             }
         }
 
-        // Build ssl::context and load the certificate chain + private key.
+        // Создаём ssl::context и подгружаем в него цепочку и приватный ключ.
         auto ctx = std::make_shared<ssl::context>(ssl::context::tls_server);
         ctx->set_options(
             ssl::context::default_workarounds |
-            ssl::context::no_sslv2           |
+            ssl::context::no_sslv2            |
             ssl::context::no_sslv3
         );
 
@@ -122,7 +128,7 @@ private:
             ctx->use_certificate_chain_file(cert_path);
             ctx->use_private_key_file(key_path, ssl::context::pem);
         } catch (const std::exception& e) {
-            std::cerr << "[CertManager] Failed to load cert/key for " << domain
+            std::cerr << "[CertManager] Не удалось загрузить cert/key для " << domain
                       << ": " << e.what() << "\n";
             return nullptr;
         }
@@ -131,7 +137,9 @@ private:
         return ctx;
     }
 
-    // ── X.509 certificate generation ─────────────────────────────────────────
+    // ── Генерация X.509-сертификата ──────────────────────────────────────────
+    // Шаги: загрузить корневой CA, сгенерировать RSA-ключ, собрать
+    // X.509 v3-сертификат с SAN, подписать CA-ключом, сохранить в PEM.
     static bool generate_x509(
         const std::string& domain,
         const std::string& cert_path,
@@ -141,7 +149,7 @@ private:
     {
         using namespace ssl_detail;
 
-        // 1. Load CA certificate and private key.
+        // 1. Загружаем корневой CA-сертификат и его приватный ключ.
         UniqueFile ca_crt_file, ca_key_file;
         try {
             ca_crt_file = open_file(ca_cert_path, "r");
@@ -151,82 +159,86 @@ private:
             return false;
         }
 
-        UniqueX509  ca_cert(PEM_read_X509(       ca_crt_file.get(), nullptr, nullptr, nullptr));
-        UniqueEVPKey ca_pkey(PEM_read_PrivateKey( ca_key_file.get(), nullptr, nullptr, nullptr));
+        UniqueX509   ca_cert(PEM_read_X509      (ca_crt_file.get(), nullptr, nullptr, nullptr));
+        UniqueEVPKey ca_pkey(PEM_read_PrivateKey(ca_key_file.get(), nullptr, nullptr, nullptr));
 
         if (!ca_cert || !ca_pkey) {
-            std::cerr << "[CertManager] Failed to parse CA files.\n";
+            std::cerr << "[CertManager] Не удалось разобрать CA-файлы.\n";
             return false;
         }
 
-        // 2. Generate new RSA-2048 key pair for this domain.
+        // 2. Генерируем новый RSA-2048 ключ для домена.
         UniqueEVPKey pkey = generate_rsa_key(2048);
         if (!pkey) return false;
 
-        // 3. Build the X.509 v3 certificate.
+        // 3. Собираем X.509 v3-сертификат и подписываем его CA-ключом.
         UniqueX509 cert = build_certificate(domain, pkey.get(), ca_cert.get(), ca_pkey.get());
         if (!cert) return false;
 
-        // 4. Write PEM files.
+        // 4. Сохраняем в PEM-файлы.
         return write_pem_files(cert.get(), pkey.get(), cert_path, key_path);
     }
 
-    // ── RSA key generation ───────────────────────────────────────────────────
+    // ── Генерация RSA-ключа ──────────────────────────────────────────────────
     static ssl_detail::UniqueEVPKey generate_rsa_key(int bits) {
         using namespace ssl_detail;
 
         UniqueEVPPkeyCtx pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr));
-        if (!pctx                                       ||
-            EVP_PKEY_keygen_init(pctx.get())        <= 0 ||
+        if (!pctx                                                ||
+            EVP_PKEY_keygen_init(pctx.get())               <= 0 ||
             EVP_PKEY_CTX_set_rsa_keygen_bits(pctx.get(), bits) <= 0)
         {
-            std::cerr << "[CertManager] EVP_PKEY context setup failed.\n";
+            std::cerr << "[CertManager] Настройка EVP_PKEY-контекста не удалась.\n";
             return nullptr;
         }
 
         EVP_PKEY* raw = nullptr;
         if (EVP_PKEY_keygen(pctx.get(), &raw) <= 0 || !raw) {
-            std::cerr << "[CertManager] RSA key generation failed.\n";
+            std::cerr << "[CertManager] Генерация RSA-ключа не удалась.\n";
             return nullptr;
         }
         return UniqueEVPKey(raw);
     }
 
-    // ── Certificate construction ─────────────────────────────────────────────
+    // ── Сборка X.509-сертификата для домена ──────────────────────────────────
     static ssl_detail::UniqueX509 build_certificate(
         const std::string& domain,
-        EVP_PKEY* pkey,
-        X509*     ca_cert,
-        EVP_PKEY* ca_pkey)
+        EVP_PKEY*          pkey,
+        X509*              ca_cert,
+        EVP_PKEY*          ca_pkey)
     {
         using namespace ssl_detail;
 
         UniqueX509 cert(X509_new());
         if (!cert) return nullptr;
 
-        // X.509 v3 (value 2), serial 1, validity window.
+        // Версия X.509 v3 (числовое значение 2), серийник 1, окно валидности.
+        // ВНИМАНИЕ: серийный номер фиксированный (=1) — все генерируемые
+        // сертификаты будут иметь один и тот же serial. По RFC 5280 это
+        // нарушение для CA. Браузеры могут это терпеть, но строгие
+        // (Chrome >= 124) — могут начать отвергать.
         X509_set_version(cert.get(), 2);
         ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1);
-        X509_gmtime_adj(X509_get_notBefore(cert.get()), -10000); // slight back-date for clock skew
-        X509_gmtime_adj(X509_get_notAfter(cert.get()),  31536000L); // 1 year
+        X509_gmtime_adj(X509_get_notBefore(cert.get()), -10000);    // back-date на случай рассинхронизации часов
+        X509_gmtime_adj(X509_get_notAfter(cert.get()),  31536000L); // срок 1 год
 
         X509_set_pubkey(cert.get(), pkey);
 
-        // Subject name: Country + Common Name.
+        // Subject Name: Country + Common Name.
         X509_NAME* name = X509_get_subject_name(cert.get());
         X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC,
                                    reinterpret_cast<const unsigned char*>("RU"), -1, -1, 0);
         X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                    reinterpret_cast<const unsigned char*>(domain.c_str()), -1, -1, 0);
 
-        // Issuer = CA subject.
+        // Issuer = subject CA-сертификата (по нему клиент строит цепочку).
         X509_set_issuer_name(cert.get(), X509_get_subject_name(ca_cert));
 
-        // SAN extension: covers the domain and all its sub-domains.
+        // Расширение SAN: покрывает домен и все его поддомены.
         if (!add_san_extension(cert.get(), ca_cert, domain))
             return nullptr;
 
-        // Sign with CA key using SHA-256.
+        // Подпись CA-ключом по SHA-256.
         if (!X509_sign(cert.get(), ca_pkey, EVP_sha256())) {
             std::cerr << "[CertManager] X509_sign failed.\n";
             return nullptr;
@@ -235,7 +247,9 @@ private:
         return cert;
     }
 
-    // ── SAN extension helper ─────────────────────────────────────────────────
+    // ── Subject Alternative Name (DNS) ───────────────────────────────────────
+    // Добавляет в сертификат расширение SAN с парой записей: сам домен и
+    // wildcard-поддомен. Современные браузеры требуют SAN, CN уже не учитывают.
     static bool add_san_extension(X509* cert, X509* ca_cert, const std::string& domain) {
         using namespace ssl_detail;
 
@@ -248,7 +262,7 @@ private:
             nullptr, &v3ctx, NID_subject_alt_name, san_value.c_str()));
 
         if (!ext) {
-            std::cerr << "[CertManager] Failed to create SAN extension for: " << domain << "\n";
+            std::cerr << "[CertManager] Не удалось создать SAN для: " << domain << "\n";
             return false;
         }
 
@@ -256,7 +270,7 @@ private:
         return true;
     }
 
-    // ── PEM file writer ──────────────────────────────────────────────────────
+    // ── Запись PEM-файлов сертификата и ключа ────────────────────────────────
     static bool write_pem_files(
         X509*              cert,
         EVP_PKEY*          pkey,

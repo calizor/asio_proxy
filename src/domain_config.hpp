@@ -10,113 +10,116 @@
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DomainConfig — loads MITM / tunnel domain lists from a text config file.
+//  DomainConfig — загружает списки MITM- и tunnel-доменов из текстового
+//  конфига и решает, как обрабатывать каждый домен.
 //
-//  File format (proxy.conf):
+//  Формат файла (proxy.conf):
 //
-//      # comment
+//      # комментарий
 //      [tunnel]
-//      paypal.com          # this domain and all its subdomains → blind tunnel
+//      paypal.com          # сам домен и все поддомены → blind tunnel
 //      ocsp.digicert.com
 //
 //      [mitm]
-//      github.com          # explicitly force MITM (optional, useful for testing)
+//      github.com          # явно форсим MITM (опционально, для тестов)
 //
-//  Rules:
-//   - [tunnel] entries are checked first and have higher priority than [mitm].
-//   - A domain matches an entry if it equals the entry OR is a subdomain of it.
-//     e.g. "cdn.example.com" matches entry "example.com".
-//   - Domains not matched by any entry default to MITM.
-//   - If the config file is missing, built-in safe defaults are used.
-//   - Blank lines and lines starting with '#' are ignored.
-//   - Inline comments (everything after the first '#' on a line) are stripped.
+//  Правила:
+//   - Сначала проверяется [tunnel] — у него приоритет над [mitm].
+//   - Домен совпадает с записью, если равен ей ИЛИ является её поддоменом.
+//     Пример: "cdn.example.com" совпадает с записью "example.com".
+//   - Если домен не попал ни в один список — по умолчанию идёт в MITM.
+//   - Если конфиг не найден — используются встроенные дефолты.
+//   - Пустые строки и строки с '#' в начале игнорируются.
+//   - Inline-комментарии (всё после первого '#') обрезаются.
 // ─────────────────────────────────────────────────────────────────────────────
 class DomainConfig {
    public:
-    // Load from file. Returns a ready-to-use instance.
-    // If the file cannot be opened the built-in defaults are used and a
-    // warning is printed; the program continues normally.
+    // Загрузить конфиг из файла. Если файл недоступен — печатает предупреждение
+    // и возвращает экземпляр с встроенными дефолтами (программа продолжает
+    // работать).
     static std::shared_ptr<DomainConfig> load(const std::string& path = "proxy.conf") {
         auto cfg = std::make_shared<DomainConfig>();
         cfg->load_defaults();
 
         std::ifstream file(path);
         if (!file.is_open()) {
-            std::cerr << "[CONFIG] Cannot open \"" << path
-                      << "\" — using built-in defaults.\n";
+            std::cerr << "[CONFIG] Не удалось открыть \"" << path
+                      << "\" — используются встроенные дефолты.\n";
             return cfg;
         }
 
-        // Clear defaults — the file takes full control.
+        // Файл найден — он берёт управление на себя, дефолты сбрасываем.
         cfg->tunnel_list_.clear();
         cfg->mitm_list_.clear();
 
         enum class Section { None, Tunnel, Mitm } section = Section::None;
         std::string line;
-        int line_no = 0;
+        int         line_no = 0;
 
         while (std::getline(file, line)) {
             ++line_no;
 
-            // Strip inline comment.
+            // Обрезаем inline-комментарий.
             if (auto pos = line.find('#'); pos != std::string::npos)
                 line.resize(pos);
 
-            // Trim whitespace.
+            // Триммируем пробельные символы по краям.
             line.erase(0, line.find_first_not_of(" \t\r\n"));
             line.erase(line.find_last_not_of(" \t\r\n") + 1);
 
             if (line.empty()) continue;
 
-            // Section header.
+            // Заголовок секции.
             if (line.front() == '[') {
-                if (line == "[tunnel]")      section = Section::Tunnel;
+                if      (line == "[tunnel]") section = Section::Tunnel;
                 else if (line == "[mitm]")   section = Section::Mitm;
                 else {
-                    std::cerr << "[CONFIG] Unknown section \"" << line
-                              << "\" at line " << line_no << " — skipped.\n";
+                    std::cerr << "[CONFIG] Неизвестная секция \"" << line
+                              << "\" в строке " << line_no << " — пропущена.\n";
                     section = Section::None;
                 }
                 continue;
             }
 
-            // Domain entry.
+            // Запись домена.
             switch (section) {
                 case Section::Tunnel: cfg->tunnel_list_.push_back(line); break;
                 case Section::Mitm:   cfg->mitm_list_.push_back(line);   break;
                 case Section::None:
-                    std::cerr << "[CONFIG] Entry \"" << line << "\" at line "
-                              << line_no << " is outside any section — skipped.\n";
+                    std::cerr << "[CONFIG] Запись \"" << line << "\" в строке "
+                              << line_no << " вне какой-либо секции — пропущена.\n";
                     break;
             }
         }
 
-        std::cout << "[CONFIG] Loaded from \"" << path << "\": "
+        std::cout << "[CONFIG] Загружено из \"" << path << "\": "
                   << cfg->tunnel_list_.size() << " tunnel, "
-                  << cfg->mitm_list_.size()   << " mitm entries.\n";
+                  << cfg->mitm_list_.size()   << " mitm.\n";
         return cfg;
     }
 
-    // Returns true  → MitmSession
-    // Returns false → TunnelSession
+    // Возвращает true  → нужна MitmSession (расшифровываем TLS).
+    // Возвращает false → нужна TunnelSession (просто прокидываем байты).
     bool is_mitm(const std::string& domain) const {
-        // tunnel_list has priority.
+        // У tunnel_list_ приоритет.
         if (matches_any(domain, tunnel_list_)) return false;
-        // explicit mitm_list overrides the default (useful for testing).
+        // Если задан явный белый список mitm_list_ — берём в MITM только то,
+        // что в нём есть. Иначе по умолчанию всё, что не tunnel, идёт в MITM.
         if (!mitm_list_.empty() && !matches_any(domain, mitm_list_)) return false;
         return true;
     }
 
    private:
     std::vector<std::string> tunnel_list_;
-    std::vector<std::string> mitm_list_;   // if non-empty: only these → MITM
+    std::vector<std::string> mitm_list_;  // если непустой — MITM только для них
 
-    // ── Built-in defaults ─────────────────────────────────────────────────────
-    // Used when proxy.conf is absent. Covers the most common cases where MITM
-    // breaks connections (OCSP, pinned certs, financial apps, messengers).
+    // ── Встроенные дефолты ───────────────────────────────────────────────────
+    // Используются, если proxy.conf отсутствует. Покрывают типичные случаи,
+    // где MITM ломает соединение: OCSP, pinned-сертификаты, банкинг,
+    // мессенджеры с end-to-end шифрованием.
     void load_defaults() {
         tunnel_list_ = {
-            // OCSP / CRL — certificate revocation infrastructure
+            // OCSP / CRL — инфраструктура отзыва сертификатов
             "ocsp.digicert.com",
             "ocsp.pki.goog",
             "ocsp.comodoca.com",
@@ -125,20 +128,20 @@ class DomainConfig {
             "crl.microsoft.com",
             "crl3.digicert.com",
             "crl4.digicert.com",
-            // OS / browser updates
+            // Обновления ОС и браузеров
             "update.googleapis.com",
             "clients2.google.com",
             "dl.google.com",
             "update.microsoft.com",
             "windowsupdate.microsoft.com",
             "download.windowsupdate.com",
-            // Financial services
+            // Финансовые сервисы
             "paypal.com",
             "braintreegateway.com",
             "stripe.com",
             "visa.com",
             "mastercard.com",
-            // Secure messaging
+            // Защищённые мессенджеры
             "whatsapp.com",
             "whatsapp.net",
             "signal.org",
@@ -148,10 +151,13 @@ class DomainConfig {
             "icloud.com",
             "mzstatic.com",
         };
-        // mitm_list_ stays empty → all non-tunnelled domains go to MITM
+        // mitm_list_ остаётся пустым → всё, что не tunnel, идёт в MITM
     }
 
-    // ── Suffix matching ───────────────────────────────────────────────────────
+    // ── Сопоставление по суффиксу ────────────────────────────────────────────
+    // Домен совпадает либо ровно, либо как поддомен (через '.').
+    // "cdn.example.com" совпадает с "example.com",
+    // но "notexample.com" — не совпадает.
     static bool matches_suffix(const std::string& domain, std::string_view suffix) {
         if (domain == suffix) return true;
         if (domain.size() > suffix.size() &&
@@ -161,8 +167,8 @@ class DomainConfig {
         return false;
     }
 
-    static bool matches_any(const std::string& domain,
-                             const std::vector<std::string>& list) {
+    static bool matches_any(const std::string&              domain,
+                            const std::vector<std::string>& list) {
         for (const auto& s : list)
             if (matches_suffix(domain, s)) return true;
         return false;
