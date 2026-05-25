@@ -4,9 +4,11 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <deque>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -19,9 +21,10 @@ namespace websocket = beast::websocket;
 using tcp           = asio::ip::tcp;
 using json          = nlohmann::json;
 
-static constexpr size_t BODY_MAX_BYTES = 65536; // 64 KB
+static constexpr size_t BODY_MAX_BYTES = 65536;  // 64 КБ — потолок сохраняемого тела
 
-// Returns true if Content-Type is textual and worth capturing
+// Возвращает true для Content-Type, тело которого имеет смысл показывать
+// в веб-панели как текст (всё остальное — бинарь, его не сохраняем).
 static inline bool is_text_content_type(const std::string& ct) {
     if (ct.find("text/")                  != std::string::npos) return true;
     if (ct.find("application/json")       != std::string::npos) return true;
@@ -32,21 +35,23 @@ static inline bool is_text_content_type(const std::string& ct) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LogEntry — one row in the web panel (like a Wireshark packet)
+//  LogEntry — одна строка в веб-панели (по аналогии с пакетом в Wireshark).
+//  Каждое событие сериализуется в JSON и рассылается через WebSocket всем
+//  подключённым клиентам, а также сохраняется в кольцевой истории.
 // ─────────────────────────────────────────────────────────────────────────────
 struct LogEntry {
-    uint64_t    id           = 0;
+    uint64_t    id             = 0;
     std::string timestamp;
     std::string type;         // CONNECT | MITM | TUNNEL | CACHE_HIT | CACHE_MISS | RESPONSE | TIMEOUT | ERROR
     std::string method;       // GET / POST / CONNECT / …
     std::string domain;
     std::string path;
-    int         status       = 0;   // HTTP status (0 = none)
+    int         status         = 0;   // HTTP-статус (0 — нет)
     std::string info;
-    size_t      bytes        = 0;
-    double      latency_ms   = 0.0;
+    size_t      bytes          = 0;
+    double      latency_ms     = 0.0;
     std::string content_type;
-    std::string body;               // text bodies only, max BODY_MAX_BYTES
+    std::string body;                  // только текстовые тела, до BODY_MAX_BYTES
     bool        body_truncated = false;
 
     std::string to_json() const {
@@ -65,29 +70,35 @@ struct LogEntry {
             {"body",           body},
             {"body_truncated", body_truncated},
         };
-        // ensure_ascii=true replaces invalid UTF-8 bytes with \uFFFD instead of throwing
+        // ensure_ascii=true заменяет невалидные UTF-8-байты на \uFFFD,
+        // вместо того чтобы бросать исключение из nlohmann::json.
         return j.dump(-1, ' ', true);
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LogServer — singleton WebSocket server (default port 8081).
+//  LogServer — singleton-сервер WebSocket для веб-панели (по умолчанию 8081).
 //
-//  Usage from anywhere in the proxy:
+//  Назначение: показывать в браузере в реальном времени, что делает прокси.
+//  Веб-страница panel.html подключается к ws://localhost:8081, получает
+//  снапшот недавней истории и далее слушает поток новых событий.
+//
+//  Использование из любой точки прокси:
 //      LogServer::instance().log_connect("github.com");
 //      LogServer::instance().log_response("github.com", "/", 200, 4096, 55.3);
 // ─────────────────────────────────────────────────────────────────────────────
 class LogServer : public std::enable_shared_from_this<LogServer> {
-    // ── WebSocket session (one per connected browser tab) ────────────────────
+    // ── WebSocket-сессия (одна на подключённую вкладку браузера) ─────────────
     struct WsSession : public std::enable_shared_from_this<WsSession> {
         websocket::stream<tcp::socket> ws_;
-        std::deque<std::string>        queue_;   // outgoing message queue
+        std::deque<std::string>        queue_;    // очередь исходящих сообщений
         bool                           writing_ = false;
         std::mutex                     mu_;
 
         explicit WsSession(tcp::socket socket) : ws_(std::move(socket)) {}
 
-        // Send history snapshot, then start relaying live events
+        // После handshake отправляем снапшот истории, далее переходим в
+        // потоковый режим (live-события приходят через enqueue).
         void start(std::vector<std::string> snapshot) {
             ws_.set_option(websocket::stream_base::decorator([](websocket::response_type& res) {
                 res.set(beast::http::field::server, "ProxyPanel/1.0");
@@ -102,19 +113,20 @@ class LogServer : public std::enable_shared_from_this<LogServer> {
             });
         }
 
+        // Добавить сообщение в очередь; запустить flush, если не идёт запись.
         void enqueue(const std::string& msg) {
             std::lock_guard<std::mutex> lk(mu_);
             queue_.push_back(msg);
             if (!writing_) flush();
         }
 
-    private:
-        // Drain the outgoing queue one message at a time
+       private:
+        // Отдаёт по одному сообщению из очереди через async_write.
         void flush() {
             if (queue_.empty()) { writing_ = false; return; }
-            writing_   = true;
-            auto self  = shared_from_this();
-            auto buf   = std::make_shared<std::string>(std::move(queue_.front()));
+            writing_  = true;
+            auto self = shared_from_this();
+            auto buf  = std::make_shared<std::string>(std::move(queue_.front()));
             queue_.pop_front();
             ws_.async_write(asio::buffer(*buf), [self, buf](beast::error_code ec, std::size_t) {
                 std::lock_guard<std::mutex> lk(self->mu_);
@@ -123,7 +135,8 @@ class LogServer : public std::enable_shared_from_this<LogServer> {
             });
         }
 
-        // Keep the connection alive (browser never sends anything, but we still need to read)
+        // Браузер сам ничего не шлёт, но read нужен — без него не отлавливаются
+        // close-frames и пинги, и сессия будет висеть «полузакрытой».
         void keep_alive_read() {
             auto self = shared_from_this();
             auto buf  = std::make_shared<beast::flat_buffer>();
@@ -133,42 +146,45 @@ class LogServer : public std::enable_shared_from_this<LogServer> {
         }
     };
 
-    // ── LogServer state ──────────────────────────────────────────────────────
+    // ── Состояние LogServer ──────────────────────────────────────────────────
     tcp::acceptor                           acceptor_;
     std::mutex                              history_mu_;
-    std::deque<std::string>                 history_;        // last N serialised entries
+    std::deque<std::string>                 history_;       // последние N сериализованных событий
     static constexpr size_t                 MAX_HISTORY = 500;
     std::atomic<uint64_t>                   counter_{1};
     std::mutex                              sessions_mu_;
     std::vector<std::shared_ptr<WsSession>> sessions_;
 
-public:
+   public:
     LogServer(asio::io_context& ctx, unsigned short port)
         : acceptor_(ctx, {tcp::v4(), port}) {}
 
-    // ── Singleton access ─────────────────────────────────────────────────────
+    // ── Доступ к синглтону ───────────────────────────────────────────────────
     static LogServer& instance() { return *singleton(); }
 
     static void init(asio::io_context& ctx, unsigned short port = 8081) {
         singleton() = std::make_shared<LogServer>(ctx, port);
         singleton()->accept_loop();
-        std::cout << "[LogServer] web panel listening on ws://localhost:" << port << "\n";
+        std::cout << "[LogServer] веб-панель слушает ws://localhost:" << port << "\n";
     }
 
-    // Must be called after ioc.stop() and thread join, but BEFORE ioc destructor.
-    // Releases the acceptor and all sessions so they don't outlive io_context.
+    // Должен быть вызван ПОСЛЕ ioc.stop() и join потоков, но ДО уничтожения
+    // io_context. Иначе static shared_ptr переживает ioc, и TSan ловит
+    // heap-use-after-free внутри reactive_socket_service::destroy().
     static void shutdown() {
         singleton().reset();
     }
 
-    // ── Core log method ──────────────────────────────────────────────────────
+    // ── Базовый метод логирования ────────────────────────────────────────────
+    // Заполняет id и timestamp, сериализует в JSON, рассылает всем подключённым
+    // сессиям и кладёт в кольцевую историю для поздних подписчиков.
     void log(LogEntry entry) {
         entry.id        = counter_++;
         entry.timestamp = current_time();
 
         const std::string msg = entry.to_json();
 
-        // Broadcast to every connected browser, prune dead sessions
+        // Рассылка по живым сессиям; мёртвые удаляем здесь же.
         {
             std::lock_guard<std::mutex> lk(sessions_mu_);
             sessions_.erase(
@@ -178,7 +194,7 @@ public:
             for (auto& s : sessions_) s->enqueue(msg);
         }
 
-        // Keep a rolling history for late-joining browsers
+        // Кольцевая история — для вновь подключающихся вкладок.
         {
             std::lock_guard<std::mutex> lk(history_mu_);
             history_.push_back(msg);
@@ -186,7 +202,7 @@ public:
         }
     }
 
-    // ── Convenience helpers ──────────────────────────────────────────────────
+    // ── Удобные обёртки для типовых событий ──────────────────────────────────
     void log_connect(const std::string& domain) {
         log({.type="CONNECT", .method="CONNECT", .domain=domain});
     }
@@ -205,19 +221,19 @@ public:
 
     void log_response(const std::string& domain, const std::string& path,
                       int status, size_t bytes, double ms,
-                      const std::string& ct   = "",
-                      const std::string& body = "",
-                      bool truncated          = false) {
+                      const std::string& ct        = "",
+                      const std::string& body      = "",
+                      bool               truncated = false) {
         log({
-            .type          = "RESPONSE",
-            .method        = "GET",
-            .domain        = domain,
-            .path          = path,
-            .status        = status,
-            .bytes         = bytes,
-            .latency_ms    = ms,
-            .content_type  = ct,
-            .body          = body,
+            .type           = "RESPONSE",
+            .method         = "GET",
+            .domain         = domain,
+            .path           = path,
+            .status         = status,
+            .bytes          = bytes,
+            .latency_ms     = ms,
+            .content_type   = ct,
+            .body           = body,
             .body_truncated = truncated,
         });
     }
@@ -230,13 +246,13 @@ public:
         log({.type="ERROR", .domain=domain, .info=err});
     }
 
-private:
-    // ── Accept loop ──────────────────────────────────────────────────────────
+   private:
+    // ── Цикл приёма WebSocket-соединений ─────────────────────────────────────
     void accept_loop() {
         auto self = shared_from_this();
         acceptor_.async_accept([self](beast::error_code ec, tcp::socket socket) {
             if (!ec) {
-                // Give the new client a copy of recent history
+                // Каждому новому клиенту отдаём копию недавней истории.
                 std::vector<std::string> snapshot;
                 {
                     std::lock_guard<std::mutex> lk(self->history_mu_);
@@ -250,20 +266,21 @@ private:
                 }
                 session->start(std::move(snapshot));
             }
-            self->accept_loop(); // keep accepting
+            self->accept_loop();  // продолжаем accept-loop
         });
     }
 
-    // ── Singleton storage ────────────────────────────────────────────────────
+    // ── Хранилище синглтона ──────────────────────────────────────────────────
     static std::shared_ptr<LogServer>& singleton() {
         static std::shared_ptr<LogServer> ptr;
         return ptr;
     }
 
-    // ── Timestamp helper ─────────────────────────────────────────────────────
+    // ── Хелпер форматирования времени ────────────────────────────────────────
     static std::string current_time() {
         auto now  = std::chrono::system_clock::now();
-        auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()) % 1000;
         auto time = std::chrono::system_clock::to_time_t(now);
         std::tm tm{};
 #ifdef _WIN32

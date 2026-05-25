@@ -14,20 +14,36 @@
 namespace asio = boost::asio;
 using tcp      = asio::ip::tcp;
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  TunnelSession — слепой туннель (без расшифровки TLS).
+//
+//  Используется для доменов из списка [tunnel] в proxy.conf: OCSP/CRL,
+//  pinned-certs (банкинг, мессенджеры), Apple-сервисы и т.п. — везде, где
+//  MITM ломает соединение.
+//
+//  Алгоритм: после CONNECT поднимаем TCP-соединение к таргету и тупо
+//  перекидываем байты в обе стороны (client→target и target→client) до
+//  закрытия любой из сторон или срабатывания таймаута бездействия.
+//
+//  Параметр cache в конструкторе игнорируется — туннель ничего не кэширует.
+//  Сигнатура сохранена, чтобы ConnectionHandler::send_connect_ok_then мог
+//  использовать единый шаблон для MITM- и TUNNEL-сессий.
+// ─────────────────────────────────────────────────────────────────────────────
 class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     tcp::socket   client_socket_;
     tcp::socket   target_socket_;
     tcp::resolver resolver_;
     std::string   target_domain_;
 
-    std::array<char, 8192> client_buf_;
-    std::array<char, 8192> target_buf_;
+    std::array<char, 8192> client_buf_;   // буфер для chunks client→target
+    std::array<char, 8192> target_buf_;   // буфер для chunks target→client
 
     boost::asio::steady_timer deadline_;
-    std::atomic<bool>         closed_{false};
+    std::atomic<bool>         closed_{false};   // защита от двойного close()
 
    public:
-    TunnelSession(tcp::socket socket, std::string domain, std::shared_ptr<LRUCache> /*cache*/ = nullptr)
+    TunnelSession(tcp::socket socket, std::string domain,
+                  std::shared_ptr<LRUCache> /*cache, не используется*/ = nullptr)
         : client_socket_(std::move(socket)),
           target_socket_(client_socket_.get_executor()),
           resolver_(client_socket_.get_executor()),
@@ -40,11 +56,14 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
     }
 
    private:
+    // ── Таймаут бездействия ──────────────────────────────────────────────────
+    // Каждый успешный read обновляет дедлайн. Если 30 секунд ничего не
+    // приходит — обрываем соединение и логируем как TIMEOUT.
     void reset_deadline() {
         deadline_.expires_after(std::chrono::seconds(30));
         auto self = shared_from_this();
         deadline_.async_wait([self](boost::system::error_code ec) {
-            if (ec == boost::asio::error::operation_aborted) return;
+            if (ec == boost::asio::error::operation_aborted) return;  // штатно отменён
             if (!ec) {
                 LogServer::instance().log_timeout(self->target_domain_);
                 self->close();
@@ -52,6 +71,7 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
         });
     }
 
+    // ── DNS-резолв и подключение к таргету ───────────────────────────────────
     void resolve_target() {
         auto self = shared_from_this();
         resolver_.async_resolve(
@@ -62,7 +82,6 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
                         self->target_socket_, results,
                         [self](boost::system::error_code ec, const tcp::endpoint&) {
                             if (!ec) {
-                                // Логируем туннель
                                 LogEntry e;
                                 e.type   = "TUNNEL";
                                 e.method = "CONNECT";
@@ -71,22 +90,26 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
                                 LogServer::instance().log(std::move(e));
                                 self->start_pipe();
                             } else {
-                                LogServer::instance().log_error(self->target_domain_, "Tunnel connect: " + ec.message());
+                                LogServer::instance().log_error(self->target_domain_,
+                                    "Tunnel connect: " + ec.message());
                                 self->close();
                             }
                         });
                 } else {
-                    LogServer::instance().log_error(self->target_domain_, "Tunnel DNS: " + ec.message());
+                    LogServer::instance().log_error(self->target_domain_,
+                        "Tunnel DNS: " + ec.message());
                     self->close();
                 }
             });
     }
 
+    // ── Старт двунаправленной перекачки байтов ───────────────────────────────
     void start_pipe() {
         pipe_client_to_target();
         pipe_target_to_client();
     }
 
+    // Направление client → target.
     void pipe_client_to_target() {
         auto self = shared_from_this();
         client_socket_.async_read_some(
@@ -106,6 +129,7 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
             });
     }
 
+    // Направление target → client.
     void pipe_target_to_client() {
         auto self = shared_from_this();
         target_socket_.async_read_some(
@@ -125,8 +149,11 @@ class TunnelSession : public std::enable_shared_from_this<TunnelSession> {
             });
     }
 
+    // ── Закрытие сессии ──────────────────────────────────────────────────────
+    // Может быть вызван конкурентно с обеих pipe-цепочек И из таймера.
+    // closed_.exchange(true) гарантирует, что shutdown/close выполнятся
+    // ровно один раз.
     void close() {
-        // Guard against concurrent calls from both pipe directions.
         if (closed_.exchange(true)) return;
         boost::system::error_code ec;
         deadline_.cancel();
