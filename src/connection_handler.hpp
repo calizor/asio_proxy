@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "domain_config.hpp"
 #include "log_server.hpp"
 #include "lru_cache.hpp"
 #include "mitm_session.hpp"
@@ -19,11 +20,16 @@ class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
     tcp::socket               client_socket_;
     boost::beast::flat_buffer buffer_;
     http::request_parser<http::string_body> parser_;
-    std::shared_ptr<LRUCache> cache_;
+    std::shared_ptr<LRUCache>     cache_;
+    std::shared_ptr<DomainConfig> config_;
 
    public:
-    ConnectionHandler(tcp::socket socket, std::shared_ptr<LRUCache> cache)
-        : client_socket_(std::move(socket)), cache_(std::move(cache)) {}
+    ConnectionHandler(tcp::socket socket,
+                      std::shared_ptr<LRUCache>     cache,
+                      std::shared_ptr<DomainConfig> config)
+        : client_socket_(std::move(socket)),
+          cache_(std::move(cache)),
+          config_(std::move(config)) {}
 
     void start() {
         auto self = shared_from_this();
@@ -40,7 +46,18 @@ class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
         auto req = parser_.get();
 
         if (req.method() != http::verb::connect) {
-            // Plain HTTP — not supported yet
+            // Plain HTTP — not supported, return 501
+            auto self = shared_from_this();
+            auto resp = std::make_shared<std::string>(
+                "HTTP/1.1 501 Not Implemented\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n\r\n");
+            asio::async_write(client_socket_, asio::buffer(*resp),
+                [self, resp](boost::system::error_code, std::size_t) {
+                    boost::system::error_code ec;
+                    self->client_socket_.shutdown(tcp::socket::shutdown_both, ec);
+                    self->client_socket_.close(ec);
+                });
             return;
         }
 
@@ -72,7 +89,6 @@ class ConnectionHandler : public std::enable_shared_from_this<ConnectionHandler>
     }
 
     bool is_mitm_domain(const std::string& domain) {
-        (void)domain;
-        return true;  // все через MITM
+        return config_->is_mitm(domain);
     }
 };

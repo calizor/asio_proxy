@@ -6,6 +6,7 @@
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -43,6 +44,7 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
     std::string target_domain_;
 
     boost::asio::steady_timer deadline_;
+    std::atomic<bool>         closed_{false};
 
     // Для измерения латентности
     std::chrono::steady_clock::time_point req_start_;
@@ -56,6 +58,8 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
           target_domain_(std::move(domain)),
           deadline_(client_socket_.get_executor(), std::chrono::seconds(30)) {
         target_ssl_ctx_.set_default_verify_paths();
+        // Verify the target server's certificate (prevents proxy→server MITM).
+        target_ssl_ctx_.set_verify_mode(ssl::verify_peer);
     }
 
     void start() {
@@ -133,9 +137,13 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
             if (cache_control::request_bypasses_cache(cc_req, pragma_req)) {
                 // Клиент требует свежий ответ — инвалидируем запись и идём к серверу
                 cache_->invalidate(cache_key_);
-                LogServer::instance().log({.type = "CACHE_BYPASS", .method = "GET",
-                                           .domain = target_domain_, .path = path,
-                                           .info = "cache bypassed by request directive"});
+                LogEntry bypass_entry;
+                bypass_entry.type   = "CACHE_BYPASS";
+                bypass_entry.method = "GET";
+                bypass_entry.domain = target_domain_;
+                bypass_entry.path   = path;
+                bypass_entry.info   = "cache bypassed by request directive";
+                LogServer::instance().log(std::move(bypass_entry));
             } else if (auto hit = cache_->get(cache_key_)) {
                 LogServer::instance().log_cache_hit(target_domain_, path);
                 send_cached_response(*hit);
@@ -193,6 +201,8 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
         auto self = shared_from_this();
         target_ssl_stream_.emplace(target_socket_, target_ssl_ctx_);
         SSL_set_tlsext_host_name(target_ssl_stream_->native_handle(), target_domain_.c_str());
+        // Verify that the certificate CN/SAN matches the requested hostname.
+        target_ssl_stream_->set_verify_callback(ssl::host_name_verification(target_domain_));
 
         target_ssl_stream_->async_handshake(
             ssl::stream_base::client,
@@ -226,6 +236,9 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
     void read_target_response() {
         auto self = shared_from_this();
         current_res_.clear();
+        // Discard any leftover bytes from the previous response so the parser
+        // always starts from a clean state on keep-alive connections.
+        target_buffer_.consume(target_buffer_.size());
         reset_deadline();
 
         http::async_read(
@@ -312,8 +325,15 @@ class MitmSession : public std::enable_shared_from_this<MitmSession> {
     }
 
     void close() {
+        // Guard against concurrent calls (e.g. timer + failed async op).
+        if (closed_.exchange(true)) return;
         boost::system::error_code ec;
         deadline_.cancel();
+        // Reset SSL streams *before* closing the underlying sockets.
+        // ssl::stream holds a reference to the socket; destroying it first
+        // ensures no async handler can fire against a closed socket.
+        client_ssl_stream_.reset();
+        target_ssl_stream_.reset();
         if (client_socket_.is_open()) {
             client_socket_.shutdown(tcp::socket::shutdown_both, ec);
             client_socket_.close(ec);
