@@ -1,4 +1,4 @@
-[README(2).md](https://github.com/user-attachments/files/31903913/README.2.md)
+
 # asio_proxy
 
 HTTPS MITM-прокси на C++17 поверх **Boost.Asio** / **Boost.Beast** и **OpenSSL** с потокобезопасным LRU-кэшем ответов, гибкой маршрутизацией доменов (MITM / blind tunnel) и live-панелью мониторинга трафика в браузере.
